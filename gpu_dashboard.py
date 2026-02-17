@@ -381,6 +381,8 @@ async def fetch_gpu_data(server_key: str) -> dict:
     total_power = round(sum(g["power_draw"] for g in gpus), 1)
     # "calls" = active_connections for agent servers, requests_running for vLLM
     calls = active_connections if active_connections > 0 else total_running
+    # Sum of all GPU utilizations (not average — user wants total across all 8 GPUs)
+    sum_gpu_util = sum(g["gpu_util"] for g in gpus)
 
     history[server_key].append({
         "t": now,
@@ -402,20 +404,67 @@ async def fetch_gpu_data(server_key: str) -> dict:
     hour_label = dt.strftime("%H:00")
     hour_ts = int(dt.replace(minute=0, second=0, microsecond=0).timestamp())
 
+    # vLLM aggregate stats
+    vllm_total_reqs = sum(v.get("total_requests", 0) for v in vllm_services)
+    vllm_prompt_tok = sum(v.get("prompt_tokens", 0) for v in vllm_services)
+    vllm_gen_tok = sum(v.get("generation_tokens", 0) for v in vllm_services)
+    vllm_avg_ttft = 0
+    vllm_avg_e2e = 0
+    vllm_kv_usage = 0
+    if vllm_services:
+        ttft_vals = [v["avg_ttft_ms"] for v in vllm_services if v.get("avg_ttft_ms")]
+        e2e_vals = [v["avg_e2e_s"] for v in vllm_services if v.get("avg_e2e_s")]
+        kv_vals = [v["kv_cache_usage"] for v in vllm_services if v.get("kv_cache_usage")]
+        vllm_avg_ttft = sum(ttft_vals) / len(ttft_vals) if ttft_vals else 0
+        vllm_avg_e2e = sum(e2e_vals) / len(e2e_vals) if e2e_vals else 0
+        vllm_kv_usage = max(kv_vals) if kv_vals else 0
+    vram_pct = round(sum(g["mem_used"] for g in gpus) / max(sum(g["mem_total"] for g in gpus), 1) * 100, 1)
+
     hs = hourly_stats[server_key]
     if hour_key not in hs:
         hs[hour_key] = {
             "hour_key": hour_key,
             "hour_label": hour_label,
             "hour_ts": hour_ts,
+            "samples": 0,
+            # Calls
             "max_calls": 0,
             "max_calls_time": now,
-            "max_gpu_util": 0,
+            "sum_calls": 0,
+            # GPU (sum across all GPUs, e.g. 8 GPUs at 50% each = 400%)
+            "max_gpu_util_sum": 0,
+            "max_gpu_util_avg": 0,
             "max_gpu_util_time": now,
             "calls_at_max_gpu_util": 0,
+            "sum_gpu_util": 0,
+            "gpu_count": len(gpus),
+            # Temp & Power
             "max_temp": 0,
             "max_power": 0,
-            "samples": 0,
+            "sum_temp": 0,
+            "sum_power": 0,
+            # VRAM
+            "max_vram_pct": 0,
+            # vLLM snapshot (cumulative counters — we store last seen to compute delta)
+            "max_kv_cache": 0,
+            "max_ttft_ms": 0,
+            "max_e2e_s": 0,
+            "sum_ttft_ms": 0,
+            "sum_e2e_s": 0,
+            "ttft_samples": 0,
+            "max_waiting": 0,
+            # vLLM cumulative counters (start/end for delta)
+            "_vllm_reqs_start": vllm_total_reqs,
+            "_vllm_reqs_end": vllm_total_reqs,
+            "_vllm_prompt_start": vllm_prompt_tok,
+            "_vllm_prompt_end": vllm_prompt_tok,
+            "_vllm_gen_start": vllm_gen_tok,
+            "_vllm_gen_end": vllm_gen_tok,
+            # Network (start/end for delta)
+            "_net_rx_start": net_rx,
+            "_net_rx_end": net_rx,
+            "_net_tx_start": net_tx,
+            "_net_tx_end": net_tx,
         }
         # Prune old hours
         cutoff = now - HOURLY_RETENTION * 3600
@@ -425,17 +474,45 @@ async def fetch_gpu_data(server_key: str) -> dict:
 
     h = hs[hour_key]
     h["samples"] += 1
+    h["sum_calls"] += calls
+    h["sum_gpu_util"] += avg_util
+    h["sum_temp"] += max_temp
+    h["sum_power"] += total_power
+
     if calls > h["max_calls"]:
         h["max_calls"] = calls
         h["max_calls_time"] = now
-    if avg_util > h["max_gpu_util"]:
-        h["max_gpu_util"] = round(avg_util, 1)
+    if sum_gpu_util > h["max_gpu_util_sum"]:
+        h["max_gpu_util_sum"] = sum_gpu_util
+        h["max_gpu_util_avg"] = round(avg_util, 1)
         h["max_gpu_util_time"] = now
         h["calls_at_max_gpu_util"] = calls
     if max_temp > h["max_temp"]:
         h["max_temp"] = max_temp
     if total_power > h["max_power"]:
         h["max_power"] = total_power
+    if vram_pct > h["max_vram_pct"]:
+        h["max_vram_pct"] = vram_pct
+    if total_waiting > h["max_waiting"]:
+        h["max_waiting"] = total_waiting
+    if vllm_kv_usage > h["max_kv_cache"]:
+        h["max_kv_cache"] = round(vllm_kv_usage, 1)
+    if vllm_avg_ttft > 0:
+        h["sum_ttft_ms"] += vllm_avg_ttft
+        h["ttft_samples"] += 1
+        if vllm_avg_ttft > h["max_ttft_ms"]:
+            h["max_ttft_ms"] = round(vllm_avg_ttft, 1)
+    if vllm_avg_e2e > 0:
+        h["sum_e2e_s"] += vllm_avg_e2e
+        if vllm_avg_e2e > h["max_e2e_s"]:
+            h["max_e2e_s"] = round(vllm_avg_e2e, 3)
+
+    # Update cumulative end counters
+    h["_vllm_reqs_end"] = vllm_total_reqs
+    h["_vllm_prompt_end"] = vllm_prompt_tok
+    h["_vllm_gen_end"] = vllm_gen_tok
+    h["_net_rx_end"] = net_rx
+    h["_net_tx_end"] = net_tx
 
     return data
 
@@ -468,7 +545,44 @@ async def get_daily(server_key: str):
     if server_key not in SERVERS:
         return {"error": "Unknown server"}
     hs = hourly_stats.get(server_key, {})
-    hours = sorted(hs.values(), key=lambda x: x["hour_ts"])
+    hours_raw = sorted(hs.values(), key=lambda x: x["hour_ts"])
+    # Compute derived fields for each hour
+    hours = []
+    for hr in hours_raw:
+        s = hr["samples"] or 1
+        hours.append({
+            "hour_label": hr["hour_label"],
+            "hour_ts": hr["hour_ts"],
+            "samples": hr["samples"],
+            "gpu_count": hr.get("gpu_count", 8),
+            # Calls
+            "max_calls": hr["max_calls"],
+            "avg_calls": round(hr["sum_calls"] / s, 1),
+            # GPU — sum of all GPUs and per-GPU average
+            "max_gpu_util_sum": hr.get("max_gpu_util_sum", 0),
+            "max_gpu_util_avg": hr.get("max_gpu_util_avg", 0),
+            "avg_gpu_util": round(hr["sum_gpu_util"] / s, 1),
+            "calls_at_max_gpu": hr["calls_at_max_gpu_util"],
+            # Temp & Power
+            "max_temp": hr["max_temp"],
+            "avg_temp": round(hr["sum_temp"] / s, 1),
+            "max_power": hr["max_power"],
+            "avg_power": round(hr["sum_power"] / s, 1),
+            # VRAM
+            "max_vram_pct": hr.get("max_vram_pct", 0),
+            # vLLM
+            "max_kv_cache": hr.get("max_kv_cache", 0),
+            "max_ttft_ms": hr.get("max_ttft_ms", 0),
+            "avg_ttft_ms": round(hr["sum_ttft_ms"] / hr["ttft_samples"], 1) if hr.get("ttft_samples", 0) > 0 else 0,
+            "max_e2e_s": hr.get("max_e2e_s", 0),
+            "max_waiting": hr.get("max_waiting", 0),
+            # Deltas (requests/tokens/traffic during this hour)
+            "hour_requests": max(0, hr.get("_vllm_reqs_end", 0) - hr.get("_vllm_reqs_start", 0)),
+            "hour_prompt_tokens": max(0, hr.get("_vllm_prompt_end", 0) - hr.get("_vllm_prompt_start", 0)),
+            "hour_gen_tokens": max(0, hr.get("_vllm_gen_end", 0) - hr.get("_vllm_gen_start", 0)),
+            "hour_net_rx": max(0, hr.get("_net_rx_end", 0) - hr.get("_net_rx_start", 0)),
+            "hour_net_tx": max(0, hr.get("_net_tx_end", 0) - hr.get("_net_tx_start", 0)),
+        })
     return {"hours": hours, "server_name": SERVERS[server_key]["name"]}
 
 
@@ -1167,6 +1281,7 @@ async function loadDaily() {
 }
 
 function fmtTime(ts) { return new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+function fmtTok(n) { if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'K'; return n.toString(); }
 
 function renderDailyServer(key, dd) {
   if (!dd || dd.error || !dd.hours) {
@@ -1178,59 +1293,78 @@ function renderDailyServer(key, dd) {
     return `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white">${dd.server_name}</h3><p class="text-gray-500 text-sm mt-2">No hourly data collected yet. Data populates as the dashboard runs.</p></div>`;
   }
 
-  // Pad to 24 entries if needed, split into two halves
   const padded = hours.slice(-24);
   const mid = Math.ceil(padded.length / 2);
   const left = padded.slice(0, mid);
   const right = padded.slice(mid);
+  const gpuCount = padded[0]?.gpu_count || 8;
 
-  // Summary stats
+  // Summary stats across all hours
   const allMaxCalls = Math.max(...hours.map(h=>h.max_calls), 0);
-  const allMaxUtil = Math.max(...hours.map(h=>h.max_gpu_util), 0);
-  const peakHour = hours.reduce((best, h) => h.max_calls > (best?.max_calls||0) ? h : best, hours[0]);
+  const allMaxGpuSum = Math.max(...hours.map(h=>h.max_gpu_util_sum), 0);
+  const allMaxTemp = Math.max(...hours.map(h=>h.max_temp), 0);
+  const allMaxPower = Math.max(...hours.map(h=>h.max_power), 0);
+  const totalHourReqs = hours.reduce((s,h)=>s+h.hour_requests, 0);
+  const totalPromptTok = hours.reduce((s,h)=>s+h.hour_prompt_tokens, 0);
+  const totalGenTok = hours.reduce((s,h)=>s+h.hour_gen_tokens, 0);
+  const totalNetRx = hours.reduce((s,h)=>s+h.hour_net_rx, 0);
+  const totalNetTx = hours.reduce((s,h)=>s+h.hour_net_tx, 0);
+  const peakCallsHour = hours.reduce((best, h) => h.max_calls > (best?.max_calls||0) ? h : best, hours[0]);
+  const peakGpuHour = hours.reduce((best, h) => h.max_gpu_util_sum > (best?.max_gpu_util_sum||0) ? h : best, hours[0]);
+
+  // Sparkline data
+  const callsSpark = padded.map(h=>h.max_calls);
+  const gpuSpark = padded.map(h=>h.max_gpu_util_sum);
+  const tempSpark = padded.map(h=>h.max_temp);
+  const powerSpark = padded.map(h=>h.max_power);
+  const reqsSpark = padded.map(h=>h.hour_requests);
 
   function hourRow(h) {
-    const utilColor = h.max_gpu_util >= 85 ? 'text-red-400' : h.max_gpu_util >= 50 ? 'text-amber-400' : 'text-emerald-400';
+    const gpuPct = gpuCount > 0 ? Math.round(h.max_gpu_util_sum / gpuCount) : h.max_gpu_util_avg;
+    const utilColor = gpuPct >= 85 ? 'text-red-400' : gpuPct >= 50 ? 'text-amber-400' : 'text-emerald-400';
     const callsColor = h.max_calls > 0 ? 'text-cyan-400' : 'text-gray-500';
     const callsBar = allMaxCalls > 0 ? (h.max_calls / allMaxCalls * 100) : 0;
-    const utilBar = h.max_gpu_util;
+    const gpuBar = Math.min(gpuPct, 100);
     return `<tr class="border-b border-gray-800/30 hover:bg-white/[0.03]">
-      <td class="py-2 px-3 text-gray-300 font-mono text-xs">${h.hour_label}</td>
-      <td class="py-2 px-3">
-        <div class="flex items-center gap-2">
-          <span class="${callsColor} font-semibold text-sm w-8 text-right">${h.max_calls}</span>
-          <div class="bar-track rounded-full h-1.5 flex-1"><div class="bar-fill rounded-full h-1.5" style="width:${callsBar}%;background:#06b6d4"></div></div>
+      <td class="py-1.5 px-2 text-gray-300 font-mono text-[11px]">${h.hour_label}</td>
+      <td class="py-1.5 px-2">
+        <div class="flex items-center gap-1.5">
+          <span class="${callsColor} font-semibold text-[11px] w-6 text-right">${h.max_calls}</span>
+          <div class="bar-track rounded-full h-1 flex-1"><div class="bar-fill rounded-full h-1" style="width:${callsBar}%;background:#06b6d4"></div></div>
         </div>
       </td>
-      <td class="py-2 px-3">
-        <div class="flex items-center gap-2">
-          <span class="${utilColor} font-semibold text-sm w-12 text-right">${h.max_gpu_util}%</span>
-          <div class="bar-track rounded-full h-1.5 flex-1"><div class="bar-fill rounded-full h-1.5" style="width:${utilBar}%;background:${h.max_gpu_util>=85?'#ef4444':h.max_gpu_util>=50?'#f59e0b':'#22c55e'}"></div></div>
+      <td class="py-1.5 px-2">
+        <div class="flex items-center gap-1.5">
+          <span class="${utilColor} font-semibold text-[11px] w-14 text-right">${h.max_gpu_util_sum}%<span class="text-gray-600 font-normal"> (${gpuPct})</span></span>
+          <div class="bar-track rounded-full h-1 flex-1"><div class="bar-fill rounded-full h-1" style="width:${gpuBar}%;background:${gpuPct>=85?'#ef4444':gpuPct>=50?'#f59e0b':'#22c55e'}"></div></div>
         </div>
       </td>
-      <td class="py-2 px-3 text-center">
-        <span class="text-gray-300 text-sm font-medium">${h.calls_at_max_gpu_util}</span>
-      </td>
+      <td class="py-1.5 px-2 text-center text-[11px] text-gray-300">${h.calls_at_max_gpu}</td>
+      <td class="py-1.5 px-2 text-center text-[11px] ${h.max_temp>=80?'text-red-400':h.max_temp>=60?'text-amber-400':'text-gray-400'}">${h.max_temp}°</td>
+      <td class="py-1.5 px-2 text-right text-[11px] text-gray-400">${h.max_power>0?h.max_power.toFixed(0)+'W':'-'}</td>
+      <td class="py-1.5 px-2 text-right text-[11px] text-gray-400">${h.hour_requests>0?fmt(h.hour_requests):'-'}</td>
     </tr>`;
   }
 
   function halfTable(rows, label) {
     if (rows.length === 0) return `<div class="flex-1 glass-bright rounded-xl p-4"><div class="text-xs text-gray-500 text-center py-8">No data</div></div>`;
-    return `<div class="flex-1 glass-bright rounded-xl p-4 overflow-hidden">
-      <div class="text-xs text-gray-400 mb-3 font-medium">${label}</div>
+    return `<div class="flex-1 glass-bright rounded-xl p-3 overflow-x-auto">
+      <div class="text-xs text-gray-400 mb-2 font-medium">${label}</div>
       <table class="w-full text-xs">
         <thead><tr class="text-gray-500 border-b border-gray-700/50">
-          <th class="text-left py-1.5 px-3 font-medium w-16">Time</th>
-          <th class="text-left py-1.5 px-3 font-medium">Max Calls</th>
-          <th class="text-left py-1.5 px-3 font-medium">Max GPU %</th>
-          <th class="text-center py-1.5 px-3 font-medium w-24">Calls @ Peak GPU</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">Hour</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">Peak Calls</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">GPU Sum% (avg)</th>
+          <th class="text-center py-1 px-2 font-medium text-[10px]">Calls@GPU</th>
+          <th class="text-center py-1 px-2 font-medium text-[10px]">Temp</th>
+          <th class="text-right py-1 px-2 font-medium text-[10px]">Power</th>
+          <th class="text-right py-1 px-2 font-medium text-[10px]">Reqs</th>
         </tr></thead>
         <tbody>${rows.map(hourRow).join('')}</tbody>
       </table>
     </div>`;
   }
 
-  // Time range label
   const firstHour = padded[0]?.hour_label || '?';
   const lastHour = padded[padded.length-1]?.hour_label || '?';
 
@@ -1238,27 +1372,71 @@ function renderDailyServer(key, dd) {
     <div class="flex items-center justify-between mb-4">
       <div class="flex items-center gap-3">
         <h3 class="text-lg font-semibold text-white">${dd.server_name}</h3>
-        <span class="text-xs text-gray-500">${firstHour} — ${lastHour} UTC &middot; ${padded.length}h tracked</span>
+        <span class="text-xs text-gray-500">${firstHour} — ${lastHour} UTC &middot; ${padded.length}h &middot; ${gpuCount} GPUs</span>
       </div>
       <button onclick="loadDaily()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
     </div>
 
-    <!-- Summary -->
-    <div class="grid grid-cols-3 gap-3 mb-5">
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent Calls</div>
-        <div class="text-2xl font-bold text-cyan-400">${allMaxCalls}</div>
-        <div class="text-[10px] text-gray-500">at ${peakHour?.hour_label||'?'} UTC</div>
+    <!-- Summary KPIs -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-5">
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Calls</div>
+        <div class="text-lg font-bold text-cyan-400">${allMaxCalls}</div>
+        <div class="text-[9px] text-gray-500">${peakCallsHour?.hour_label||'?'} UTC</div>
       </div>
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Peak GPU Utilization</div>
-        <div class="text-2xl font-bold ${allMaxUtil>=85?'text-red-400':allMaxUtil>=50?'text-amber-400':'text-emerald-400'}">${allMaxUtil}%</div>
-        <div class="text-[10px] text-gray-500">max across all hours</div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak GPU Sum</div>
+        <div class="text-lg font-bold ${allMaxGpuSum/gpuCount>=85?'text-red-400':allMaxGpuSum/gpuCount>=50?'text-amber-400':'text-emerald-400'}">${allMaxGpuSum}%</div>
+        <div class="text-[9px] text-gray-500">avg ${Math.round(allMaxGpuSum/gpuCount)}% per GPU</div>
       </div>
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Busiest Hour</div>
-        <div class="text-2xl font-bold text-white">${peakHour?.hour_label||'—'}</div>
-        <div class="text-[10px] text-gray-500">${peakHour?.max_calls||0} calls, ${peakHour?.max_gpu_util||0}% GPU</div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Busiest Hour</div>
+        <div class="text-lg font-bold text-white">${peakCallsHour?.hour_label||'—'}</div>
+        <div class="text-[9px] text-gray-500">${peakCallsHour?.max_calls||0} calls</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Temp</div>
+        <div class="text-lg font-bold ${allMaxTemp>=80?'text-red-400':allMaxTemp>=60?'text-amber-400':'text-emerald-400'}">${allMaxTemp}°C</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Power</div>
+        <div class="text-lg font-bold text-amber-400">${allMaxPower.toFixed(0)}W</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Total Requests</div>
+        <div class="text-lg font-bold text-white">${fmtTok(totalHourReqs)}</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Tokens In/Out</div>
+        <div class="text-sm font-bold text-purple-400">${fmtTok(totalPromptTok)}/${fmtTok(totalGenTok)}</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Network I/O</div>
+        <div class="text-sm font-bold text-gray-300">${formatBytes(totalNetRx)}/${formatBytes(totalNetTx)}</div>
+      </div>
+    </div>
+
+    <!-- Sparkline trends -->
+    <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Calls per Hour</div>
+        ${sparklineSVG(callsSpark, 140, 30, '#06b6d4')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">GPU Sum% per Hour</div>
+        ${sparklineSVG(gpuSpark, 140, 30, '#22c55e')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Temp per Hour</div>
+        ${sparklineSVG(tempSpark, 140, 30, '#ef4444')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Power per Hour</div>
+        ${sparklineSVG(powerSpark, 140, 30, '#f59e0b')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Requests per Hour</div>
+        ${sparklineSVG(reqsSpark, 140, 30, '#8b5cf6')}
       </div>
     </div>
 

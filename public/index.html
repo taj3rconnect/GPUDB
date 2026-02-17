@@ -583,6 +583,7 @@ async function loadDaily() {
 }
 
 function fmtTime(ts) { return new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+function fmtTok(n) { if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'K'; return n.toString(); }
 
 function renderDailyServer(key, dd) {
   if (!dd || dd.error || !dd.hours) {
@@ -594,59 +595,78 @@ function renderDailyServer(key, dd) {
     return `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white">${dd.server_name}</h3><p class="text-gray-500 text-sm mt-2">No hourly data collected yet. Data populates as the dashboard runs.</p></div>`;
   }
 
-  // Pad to 24 entries if needed, split into two halves
   const padded = hours.slice(-24);
   const mid = Math.ceil(padded.length / 2);
   const left = padded.slice(0, mid);
   const right = padded.slice(mid);
+  const gpuCount = padded[0]?.gpu_count || 8;
 
-  // Summary stats
+  // Summary stats across all hours
   const allMaxCalls = Math.max(...hours.map(h=>h.max_calls), 0);
-  const allMaxUtil = Math.max(...hours.map(h=>h.max_gpu_util), 0);
-  const peakHour = hours.reduce((best, h) => h.max_calls > (best?.max_calls||0) ? h : best, hours[0]);
+  const allMaxGpuSum = Math.max(...hours.map(h=>h.max_gpu_util_sum), 0);
+  const allMaxTemp = Math.max(...hours.map(h=>h.max_temp), 0);
+  const allMaxPower = Math.max(...hours.map(h=>h.max_power), 0);
+  const totalHourReqs = hours.reduce((s,h)=>s+h.hour_requests, 0);
+  const totalPromptTok = hours.reduce((s,h)=>s+h.hour_prompt_tokens, 0);
+  const totalGenTok = hours.reduce((s,h)=>s+h.hour_gen_tokens, 0);
+  const totalNetRx = hours.reduce((s,h)=>s+h.hour_net_rx, 0);
+  const totalNetTx = hours.reduce((s,h)=>s+h.hour_net_tx, 0);
+  const peakCallsHour = hours.reduce((best, h) => h.max_calls > (best?.max_calls||0) ? h : best, hours[0]);
+  const peakGpuHour = hours.reduce((best, h) => h.max_gpu_util_sum > (best?.max_gpu_util_sum||0) ? h : best, hours[0]);
+
+  // Sparkline data
+  const callsSpark = padded.map(h=>h.max_calls);
+  const gpuSpark = padded.map(h=>h.max_gpu_util_sum);
+  const tempSpark = padded.map(h=>h.max_temp);
+  const powerSpark = padded.map(h=>h.max_power);
+  const reqsSpark = padded.map(h=>h.hour_requests);
 
   function hourRow(h) {
-    const utilColor = h.max_gpu_util >= 85 ? 'text-red-400' : h.max_gpu_util >= 50 ? 'text-amber-400' : 'text-emerald-400';
+    const gpuPct = gpuCount > 0 ? Math.round(h.max_gpu_util_sum / gpuCount) : h.max_gpu_util_avg;
+    const utilColor = gpuPct >= 85 ? 'text-red-400' : gpuPct >= 50 ? 'text-amber-400' : 'text-emerald-400';
     const callsColor = h.max_calls > 0 ? 'text-cyan-400' : 'text-gray-500';
     const callsBar = allMaxCalls > 0 ? (h.max_calls / allMaxCalls * 100) : 0;
-    const utilBar = h.max_gpu_util;
+    const gpuBar = Math.min(gpuPct, 100);
     return `<tr class="border-b border-gray-800/30 hover:bg-white/[0.03]">
-      <td class="py-2 px-3 text-gray-300 font-mono text-xs">${h.hour_label}</td>
-      <td class="py-2 px-3">
-        <div class="flex items-center gap-2">
-          <span class="${callsColor} font-semibold text-sm w-8 text-right">${h.max_calls}</span>
-          <div class="bar-track rounded-full h-1.5 flex-1"><div class="bar-fill rounded-full h-1.5" style="width:${callsBar}%;background:#06b6d4"></div></div>
+      <td class="py-1.5 px-2 text-gray-300 font-mono text-[11px]">${h.hour_label}</td>
+      <td class="py-1.5 px-2">
+        <div class="flex items-center gap-1.5">
+          <span class="${callsColor} font-semibold text-[11px] w-6 text-right">${h.max_calls}</span>
+          <div class="bar-track rounded-full h-1 flex-1"><div class="bar-fill rounded-full h-1" style="width:${callsBar}%;background:#06b6d4"></div></div>
         </div>
       </td>
-      <td class="py-2 px-3">
-        <div class="flex items-center gap-2">
-          <span class="${utilColor} font-semibold text-sm w-12 text-right">${h.max_gpu_util}%</span>
-          <div class="bar-track rounded-full h-1.5 flex-1"><div class="bar-fill rounded-full h-1.5" style="width:${utilBar}%;background:${h.max_gpu_util>=85?'#ef4444':h.max_gpu_util>=50?'#f59e0b':'#22c55e'}"></div></div>
+      <td class="py-1.5 px-2">
+        <div class="flex items-center gap-1.5">
+          <span class="${utilColor} font-semibold text-[11px] w-14 text-right">${h.max_gpu_util_sum}%<span class="text-gray-600 font-normal"> (${gpuPct})</span></span>
+          <div class="bar-track rounded-full h-1 flex-1"><div class="bar-fill rounded-full h-1" style="width:${gpuBar}%;background:${gpuPct>=85?'#ef4444':gpuPct>=50?'#f59e0b':'#22c55e'}"></div></div>
         </div>
       </td>
-      <td class="py-2 px-3 text-center">
-        <span class="text-gray-300 text-sm font-medium">${h.calls_at_max_gpu_util}</span>
-      </td>
+      <td class="py-1.5 px-2 text-center text-[11px] text-gray-300">${h.calls_at_max_gpu}</td>
+      <td class="py-1.5 px-2 text-center text-[11px] ${h.max_temp>=80?'text-red-400':h.max_temp>=60?'text-amber-400':'text-gray-400'}">${h.max_temp}°</td>
+      <td class="py-1.5 px-2 text-right text-[11px] text-gray-400">${h.max_power>0?h.max_power.toFixed(0)+'W':'-'}</td>
+      <td class="py-1.5 px-2 text-right text-[11px] text-gray-400">${h.hour_requests>0?fmt(h.hour_requests):'-'}</td>
     </tr>`;
   }
 
   function halfTable(rows, label) {
     if (rows.length === 0) return `<div class="flex-1 glass-bright rounded-xl p-4"><div class="text-xs text-gray-500 text-center py-8">No data</div></div>`;
-    return `<div class="flex-1 glass-bright rounded-xl p-4 overflow-hidden">
-      <div class="text-xs text-gray-400 mb-3 font-medium">${label}</div>
+    return `<div class="flex-1 glass-bright rounded-xl p-3 overflow-x-auto">
+      <div class="text-xs text-gray-400 mb-2 font-medium">${label}</div>
       <table class="w-full text-xs">
         <thead><tr class="text-gray-500 border-b border-gray-700/50">
-          <th class="text-left py-1.5 px-3 font-medium w-16">Time</th>
-          <th class="text-left py-1.5 px-3 font-medium">Max Calls</th>
-          <th class="text-left py-1.5 px-3 font-medium">Max GPU %</th>
-          <th class="text-center py-1.5 px-3 font-medium w-24">Calls @ Peak GPU</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">Hour</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">Peak Calls</th>
+          <th class="text-left py-1 px-2 font-medium text-[10px]">GPU Sum% (avg)</th>
+          <th class="text-center py-1 px-2 font-medium text-[10px]">Calls@GPU</th>
+          <th class="text-center py-1 px-2 font-medium text-[10px]">Temp</th>
+          <th class="text-right py-1 px-2 font-medium text-[10px]">Power</th>
+          <th class="text-right py-1 px-2 font-medium text-[10px]">Reqs</th>
         </tr></thead>
         <tbody>${rows.map(hourRow).join('')}</tbody>
       </table>
     </div>`;
   }
 
-  // Time range label
   const firstHour = padded[0]?.hour_label || '?';
   const lastHour = padded[padded.length-1]?.hour_label || '?';
 
@@ -654,27 +674,71 @@ function renderDailyServer(key, dd) {
     <div class="flex items-center justify-between mb-4">
       <div class="flex items-center gap-3">
         <h3 class="text-lg font-semibold text-white">${dd.server_name}</h3>
-        <span class="text-xs text-gray-500">${firstHour} — ${lastHour} UTC &middot; ${padded.length}h tracked</span>
+        <span class="text-xs text-gray-500">${firstHour} — ${lastHour} UTC &middot; ${padded.length}h &middot; ${gpuCount} GPUs</span>
       </div>
       <button onclick="loadDaily()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
     </div>
 
-    <!-- Summary -->
-    <div class="grid grid-cols-3 gap-3 mb-5">
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent Calls</div>
-        <div class="text-2xl font-bold text-cyan-400">${allMaxCalls}</div>
-        <div class="text-[10px] text-gray-500">at ${peakHour?.hour_label||'?'} UTC</div>
+    <!-- Summary KPIs -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-5">
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Calls</div>
+        <div class="text-lg font-bold text-cyan-400">${allMaxCalls}</div>
+        <div class="text-[9px] text-gray-500">${peakCallsHour?.hour_label||'?'} UTC</div>
       </div>
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Peak GPU Utilization</div>
-        <div class="text-2xl font-bold ${allMaxUtil>=85?'text-red-400':allMaxUtil>=50?'text-amber-400':'text-emerald-400'}">${allMaxUtil}%</div>
-        <div class="text-[10px] text-gray-500">max across all hours</div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak GPU Sum</div>
+        <div class="text-lg font-bold ${allMaxGpuSum/gpuCount>=85?'text-red-400':allMaxGpuSum/gpuCount>=50?'text-amber-400':'text-emerald-400'}">${allMaxGpuSum}%</div>
+        <div class="text-[9px] text-gray-500">avg ${Math.round(allMaxGpuSum/gpuCount)}% per GPU</div>
       </div>
-      <div class="glass-bright rounded-lg p-4 text-center">
-        <div class="text-[10px] text-gray-500 uppercase mb-1">Busiest Hour</div>
-        <div class="text-2xl font-bold text-white">${peakHour?.hour_label||'—'}</div>
-        <div class="text-[10px] text-gray-500">${peakHour?.max_calls||0} calls, ${peakHour?.max_gpu_util||0}% GPU</div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Busiest Hour</div>
+        <div class="text-lg font-bold text-white">${peakCallsHour?.hour_label||'—'}</div>
+        <div class="text-[9px] text-gray-500">${peakCallsHour?.max_calls||0} calls</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Temp</div>
+        <div class="text-lg font-bold ${allMaxTemp>=80?'text-red-400':allMaxTemp>=60?'text-amber-400':'text-emerald-400'}">${allMaxTemp}°C</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Peak Power</div>
+        <div class="text-lg font-bold text-amber-400">${allMaxPower.toFixed(0)}W</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Total Requests</div>
+        <div class="text-lg font-bold text-white">${fmtTok(totalHourReqs)}</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Tokens In/Out</div>
+        <div class="text-sm font-bold text-purple-400">${fmtTok(totalPromptTok)}/${fmtTok(totalGenTok)}</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Network I/O</div>
+        <div class="text-sm font-bold text-gray-300">${formatBytes(totalNetRx)}/${formatBytes(totalNetTx)}</div>
+      </div>
+    </div>
+
+    <!-- Sparkline trends -->
+    <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Calls per Hour</div>
+        ${sparklineSVG(callsSpark, 140, 30, '#06b6d4')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">GPU Sum% per Hour</div>
+        ${sparklineSVG(gpuSpark, 140, 30, '#22c55e')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Temp per Hour</div>
+        ${sparklineSVG(tempSpark, 140, 30, '#ef4444')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Power per Hour</div>
+        ${sparklineSVG(powerSpark, 140, 30, '#f59e0b')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Requests per Hour</div>
+        ${sparklineSVG(reqsSpark, 140, 30, '#8b5cf6')}
       </div>
     </div>
 

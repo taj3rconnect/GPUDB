@@ -518,6 +518,14 @@ async def fetch_gpu_data(server_key: str) -> dict:
 
 
 # ── API Endpoints ──────────────────────────────────────────────
+@app.get("/api/agent")
+async def get_agent_status():
+    try:
+        return await asyncio.wait_for(fetch_agent_status(), timeout=15)
+    except Exception as e:
+        return {"error": str(e), "status": "offline"}
+
+
 @app.get("/api/{server_key}")
 async def get_server_data(server_key: str):
     if server_key not in SERVERS:
@@ -584,6 +592,187 @@ async def get_daily(server_key: str):
             "hour_net_tx": max(0, hr.get("_net_tx_end", 0) - hr.get("_net_tx_start", 0)),
         })
     return {"hours": hours, "server_name": SERVERS[server_key]["name"]}
+
+
+# ── Agent Status (RTX 5090 / AgentV2) ────────────────────────
+AGENT_SERVICES = [
+    {"name": "agentv2-main-server", "port": 8003, "health": "http://localhost:8003/health", "role": "Call Router"},
+    {"name": "agentv2-voicemail-processor", "port": 8001, "health": None, "role": "Voicemail/Intent Classifier"},
+    {"name": "agentv2-health-checker", "port": 9000, "health": "http://localhost:9000/health", "role": "Process Monitor"},
+    {"name": "agentv2-failed-report", "port": 8006, "health": None, "role": "Retry Queue"},
+    {"name": "agentv2-server-old", "port": None, "health": None, "role": "Legacy Server"},
+]
+
+EXTERNAL_DEPS = [
+    {"name": "vLLM LLM (Qwen3-VL-8B)", "url": "http://146.88.194.12:8001/health", "host": "146.88.194.12:8001"},
+    {"name": "vLLM TTS (recruite-tts-fp8)", "url": "http://146.88.194.12:8002/health", "host": "146.88.194.12:8002"},
+    {"name": "DCGM GPU Exporter", "url": "http://localhost:9400/metrics", "host": "localhost:9400"},
+]
+
+
+async def fetch_agent_status() -> dict:
+    server = SERVERS["rtx5090"]
+
+    # Build a combined command to gather all agent data in one SSH call
+    cmd = (
+        # Health checker status (watched PIDs = active workers)
+        "curl -s --max-time 2 localhost:9000/status 2>/dev/null; echo '===SEP==='; "
+        # Health checker health (process count)
+        "curl -s --max-time 2 localhost:9000/health 2>/dev/null; echo '===SEP==='; "
+        # Main server health
+        "curl -s --max-time 2 localhost:8003/health 2>/dev/null; echo '===SEP==='; "
+        # Failed reports queue
+        "curl -s --max-time 2 localhost:8006/v1/reports/failure 2>/dev/null; echo '===SEP==='; "
+        # Active bot child processes (spawned per call, not gunicorn workers)
+        "ps aux | grep -E 'python.*bot_' | grep -v grep | wc -l; echo '===SEP==='; "
+        # Bot process details (PID, elapsed time, RSS memory, command)
+        "ps aux | grep -E 'python.*bot_' | grep -v grep; echo '===SEP==='; "
+        # Active TCP connections to port 8003
+        "ss -tnp state established sport = :8003 2>/dev/null | tail -n +2 | wc -l; echo '===SEP==='; "
+        # Gunicorn worker count and memory
+        "ps aux | grep 'gunicorn.*server:app' | grep -v grep | wc -l; echo '===SEP==='; "
+        # Total RSS memory of gunicorn workers (KB)
+        "ps aux | grep 'gunicorn.*server:app' | grep -v grep | awk '{sum+=$6} END {print sum+0}'; echo '===SEP==='; "
+        # Voicemail processor workers
+        "ps aux | grep 'gunicorn.*voicemail' | grep -v grep | wc -l; echo '===SEP==='; "
+        # Zombie processes
+        "ps aux | grep defunct | grep -v grep | wc -l; echo '===SEP==='; "
+        # External service checks (vLLM LLM, vLLM TTS)
+        "curl -s --max-time 3 http://146.88.194.12:8001/health 2>/dev/null; echo '===SEP==='; "
+        "curl -s --max-time 3 http://146.88.194.12:8002/health 2>/dev/null; echo '===SEP==='; "
+        # DCGM GPU metrics
+        "curl -s --max-time 2 localhost:9400/metrics 2>/dev/null | grep -E 'DCGM_FI_DEV_GPU_UTIL|DCGM_FI_DEV_GPU_TEMP|DCGM_FI_DEV_POWER_USAGE|DCGM_FI_DEV_SM_CLOCK' | grep -v '^#'; echo '===SEP==='; "
+        # Service systemd status
+        "systemctl is-active agentv2-main-server agentv2-voicemail-processor agentv2-health-checker agentv2-failed-report agentv2-server-old 2>/dev/null"
+    )
+
+    raw = await run_command(server, cmd)
+    parts = raw.split("===SEP===")
+
+    def safe(i):
+        return parts[i].strip() if i < len(parts) else ""
+
+    # Parse health checker status
+    watched_pids = []
+    try:
+        hc_status = json.loads(safe(0))
+        watched_pids = hc_status.get("watching", [])
+    except Exception:
+        pass
+
+    # Health checker health
+    working_processes = 0
+    try:
+        hc_health = json.loads(safe(1))
+        working_processes = hc_health.get("working_processes", 0)
+    except Exception:
+        pass
+
+    # Main server health
+    main_healthy = False
+    try:
+        main_h = json.loads(safe(2))
+        main_healthy = main_h.get("status", False)
+    except Exception:
+        pass
+
+    # Failed reports
+    failed_reports = []
+    try:
+        failed_reports = json.loads(safe(3))
+    except Exception:
+        pass
+
+    # Active bot processes
+    active_bots = int(safe(4)) if safe(4).isdigit() else 0
+
+    # Bot details
+    bot_details = []
+    for line in safe(5).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts_line = line.split()
+        if len(parts_line) >= 11:
+            bot_details.append({
+                "pid": parts_line[1],
+                "cpu": parts_line[2],
+                "mem_pct": parts_line[3],
+                "rss_kb": int(parts_line[5]) if parts_line[5].isdigit() else 0,
+                "elapsed": parts_line[9],
+                "cmd": " ".join(parts_line[10:])[:80],
+            })
+
+    # TCP connections
+    tcp_connections = int(safe(6)) if safe(6).isdigit() else 0
+
+    # Gunicorn workers
+    gunicorn_workers = int(safe(7)) if safe(7).isdigit() else 0
+    gunicorn_rss_kb = int(safe(8)) if safe(8).isdigit() else 0
+
+    # Voicemail workers
+    voicemail_workers = int(safe(9)) if safe(9).isdigit() else 0
+
+    # Zombies
+    zombie_count = int(safe(10)) if safe(10).isdigit() else 0
+
+    # External deps
+    vllm_llm_ok = "true" in safe(11).lower() or len(safe(11)) > 0
+    vllm_tts_ok = "true" in safe(12).lower() or len(safe(12)) > 0
+
+    # DCGM GPU metrics
+    dcgm_gpus = {}
+    for line in safe(13).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'(DCGM_FI_DEV_\w+)\{gpu="(\d+)".*?\}\s+([\d.]+)', line)
+        if m:
+            metric, gpu_id, val = m.group(1), int(m.group(2)), float(m.group(3))
+            if gpu_id not in dcgm_gpus:
+                dcgm_gpus[gpu_id] = {}
+            dcgm_gpus[gpu_id][metric] = val
+
+    gpu_details = []
+    for gpu_id in sorted(dcgm_gpus.keys()):
+        g = dcgm_gpus[gpu_id]
+        gpu_details.append({
+            "index": gpu_id,
+            "sm_clock": g.get("DCGM_FI_DEV_SM_CLOCK", 0),
+            "temp": g.get("DCGM_FI_DEV_GPU_TEMP", 0),
+            "power": round(g.get("DCGM_FI_DEV_POWER_USAGE", 0), 1),
+            "util": g.get("DCGM_FI_DEV_GPU_UTIL", 0),
+        })
+
+    # Service statuses
+    svc_lines = safe(14).split("\n")
+    svc_names = ["agentv2-main-server", "agentv2-voicemail-processor", "agentv2-health-checker", "agentv2-failed-report", "agentv2-server-old"]
+    services = []
+    for i, name in enumerate(svc_names):
+        status = svc_lines[i].strip() if i < len(svc_lines) else "unknown"
+        services.append({"name": name, "status": status})
+
+    return {
+        "timestamp": time.time(),
+        "main_server_healthy": main_healthy,
+        "health_checker_workers": working_processes,
+        "watched_pids": len(watched_pids),
+        "active_bots": active_bots,
+        "bot_details": bot_details,
+        "tcp_connections": tcp_connections,
+        "gunicorn_workers": gunicorn_workers,
+        "gunicorn_memory_mb": round(gunicorn_rss_kb / 1024, 1),
+        "voicemail_workers": voicemail_workers,
+        "zombie_processes": zombie_count,
+        "failed_reports_queue": len(failed_reports),
+        "failed_reports": failed_reports[:10],
+        "services": services,
+        "external_deps": [
+            {"name": "vLLM LLM (Qwen3-VL-8B)", "host": "146.88.194.12:8001", "ok": vllm_llm_ok},
+            {"name": "vLLM TTS (recruite-tts-fp8)", "host": "146.88.194.12:8002", "ok": vllm_tts_ok},
+        ],
+        "dcgm_gpus": gpu_details,
+    }
 
 
 # ── Software Discovery ────────────────────────────────────────
@@ -767,6 +956,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('history')" id="tab-history">History & Peaks</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('software')" id="tab-software">Software & Tools</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('daily')" id="tab-daily">24h Report</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
 </div>
 
 <!-- Content -->
@@ -776,6 +966,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-history" class="hidden"></div>
   <div id="page-software" class="hidden"></div>
   <div id="page-daily" class="hidden"></div>
+  <div id="page-agent" class="hidden"></div>
 </div>
 
 <script>
@@ -791,6 +982,7 @@ let softwareLoaded = false;
 let pypiCache = {};
 let dailyData = {};
 let dailyLoaded = false;
+let agentData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -827,13 +1019,14 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
   renderAll();
   if (tab === 'software' && !softwareLoaded) loadSoftware();
   if (tab === 'daily' && !dailyLoaded) loadDaily();
+  if (tab === 'agent') loadAgent();
 }
 
 // ── Overview Tab ──
@@ -1457,6 +1650,158 @@ function renderDaily() {
   el.innerHTML = SERVERS.map(k => renderDailyServer(k, dailyData[k])).join('');
 }
 
+// ── Agent Tab ──
+async function loadAgent() {
+  const el = document.getElementById('page-agent');
+  if (!agentData) el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading AgentV2 status...</div>';
+  try {
+    const r = await fetch('/api/agent');
+    agentData = await r.json();
+  } catch(e) {
+    agentData = { error: e.message };
+  }
+  renderAgent();
+}
+
+function renderAgent() {
+  const el = document.getElementById('page-agent');
+  const d = agentData;
+  if (!d || d.error) {
+    el.innerHTML = `<div class="glass rounded-2xl p-6"><h3 class="text-lg font-semibold text-white">AgentV2 Status</h3><p class="text-red-400 text-sm mt-2">${d?.error||'Failed to load'}</p></div>`;
+    return;
+  }
+
+  // Status indicator
+  const allUp = d.services?.every(s => s.status === 'active');
+  const statusBadge = allUp
+    ? '<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"><span class="w-2 h-2 rounded-full bg-emerald-500 status-online"></span>All Services Running</span>'
+    : '<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20"><span class="w-2 h-2 rounded-full bg-amber-500"></span>Some Services Down</span>';
+
+  // KPI cards
+  let kpiHTML = `<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-5">
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Active Calls</div>
+      <div class="text-2xl font-bold ${d.active_bots>0?'text-cyan-400':'text-gray-500'}">${d.active_bots}</div>
+      <div class="text-[9px] text-gray-500">bot processes</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">TCP Connections</div>
+      <div class="text-2xl font-bold ${d.tcp_connections>0?'text-emerald-400':'text-gray-500'}">${d.tcp_connections}</div>
+      <div class="text-[9px] text-gray-500">port 8003</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Gunicorn Workers</div>
+      <div class="text-2xl font-bold text-white">${d.gunicorn_workers}</div>
+      <div class="text-[9px] text-gray-500">${d.gunicorn_memory_mb} MB RSS</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Voicemail Workers</div>
+      <div class="text-2xl font-bold text-white">${d.voicemail_workers}</div>
+      <div class="text-[9px] text-gray-500">classifier</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Health Watcher</div>
+      <div class="text-2xl font-bold text-white">${d.health_checker_workers}</div>
+      <div class="text-[9px] text-gray-500">${d.watched_pids} PIDs watched</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Failed Queue</div>
+      <div class="text-2xl font-bold ${d.failed_reports_queue>0?'text-red-400':'text-emerald-400'}">${d.failed_reports_queue}</div>
+      <div class="text-[9px] text-gray-500">pending retries</div>
+    </div>
+    <div class="glass-bright rounded-lg p-3 text-center">
+      <div class="text-[9px] text-gray-500 uppercase mb-1">Zombies</div>
+      <div class="text-2xl font-bold ${d.zombie_processes>0?'text-red-400':'text-emerald-400'}">${d.zombie_processes}</div>
+      <div class="text-[9px] text-gray-500">defunct procs</div>
+    </div>
+  </div>`;
+
+  // Services
+  let svcHTML = '<div class="glass-bright rounded-xl p-4 mb-5"><div class="text-xs text-gray-400 mb-3 font-medium">Services</div><div class="grid grid-cols-2 md:grid-cols-5 gap-2">';
+  const roles = {"agentv2-main-server":"Call Router :8003","agentv2-voicemail-processor":"Intent Classifier :8001","agentv2-health-checker":"Process Monitor :9000","agentv2-failed-report":"Retry Queue :8006","agentv2-server-old":"Legacy Server"};
+  for (const s of (d.services||[])) {
+    const ok = s.status === 'active';
+    svcHTML += `<div class="rounded-lg p-2.5 ${ok?'bg-emerald-500/5 border border-emerald-500/10':'bg-red-500/5 border border-red-500/10'}">
+      <div class="flex items-center gap-1.5 mb-1"><span class="w-1.5 h-1.5 rounded-full ${ok?'bg-emerald-500':'bg-red-500'}"></span><span class="text-[11px] font-medium ${ok?'text-emerald-400':'text-red-400'}">${ok?'Active':'Down'}</span></div>
+      <div class="text-[11px] text-white font-medium">${s.name.replace('agentv2-','')}</div>
+      <div class="text-[9px] text-gray-500">${roles[s.name]||''}</div>
+    </div>`;
+  }
+  svcHTML += '</div></div>';
+
+  // External Dependencies
+  let extHTML = '<div class="glass-bright rounded-xl p-4 mb-5"><div class="text-xs text-gray-400 mb-3 font-medium">External Dependencies</div><div class="grid grid-cols-1 md:grid-cols-2 gap-2">';
+  for (const dep of (d.external_deps||[])) {
+    extHTML += `<div class="flex items-center justify-between rounded-lg p-2.5 ${dep.ok?'bg-emerald-500/5':'bg-red-500/5'} border ${dep.ok?'border-emerald-500/10':'border-red-500/10'}">
+      <div><div class="text-[11px] text-white font-medium">${dep.name}</div><div class="text-[9px] text-gray-500 font-mono">${dep.host}</div></div>
+      <span class="text-[10px] px-2 py-0.5 rounded-full ${dep.ok?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}">${dep.ok?'Reachable':'Unreachable'}</span>
+    </div>`;
+  }
+  extHTML += '</div></div>';
+
+  // Active bot details
+  let botsHTML = '';
+  if (d.bot_details && d.bot_details.length > 0) {
+    botsHTML = `<div class="glass-bright rounded-xl p-4 mb-5">
+      <div class="text-xs text-gray-400 mb-3 font-medium">Active Call Bots (${d.bot_details.length})</div>
+      <table class="w-full text-xs"><thead><tr class="text-gray-500 border-b border-gray-700/50">
+        <th class="text-left py-1.5 font-medium">PID</th><th class="text-left py-1.5 font-medium">Elapsed</th><th class="text-right py-1.5 font-medium">CPU%</th><th class="text-right py-1.5 font-medium">Memory</th><th class="text-left py-1.5 font-medium pl-4">Command</th>
+      </tr></thead><tbody>${d.bot_details.map(b=>`<tr class="border-b border-gray-800/30">
+        <td class="py-1.5 text-gray-300 font-mono">${b.pid}</td><td class="py-1.5 text-cyan-400">${b.elapsed}</td><td class="py-1.5 text-right text-gray-400">${b.cpu}%</td><td class="py-1.5 text-right text-gray-400">${(b.rss_kb/1024).toFixed(0)} MB</td><td class="py-1.5 text-gray-500 pl-4 truncate max-w-xs" title="${b.cmd}">${b.cmd}</td>
+      </tr>`).join('')}</tbody></table>
+    </div>`;
+  }
+
+  // DCGM GPU details
+  let gpuHTML = '';
+  if (d.dcgm_gpus && d.dcgm_gpus.length > 0) {
+    gpuHTML = `<div class="glass-bright rounded-xl p-4 mb-5">
+      <div class="text-xs text-gray-400 mb-3 font-medium">GPU Telemetry (DCGM)</div>
+      <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2">${d.dcgm_gpus.map(g=>{
+        const tc = g.temp>=60?'text-red-400':g.temp>=40?'text-amber-400':'text-emerald-400';
+        return `<div class="rounded-lg p-2.5 bg-white/[0.02] border border-gray-800/50 text-center">
+          <div class="text-[9px] text-gray-500 mb-1">GPU ${g.index}</div>
+          <div class="text-sm font-semibold ${tc}">${g.temp}°C</div>
+          <div class="text-[9px] text-gray-500">${g.power}W &middot; ${g.sm_clock}MHz</div>
+          <div class="text-[9px] text-gray-500">${g.util}% util</div>
+        </div>`;
+      }).join('')}</div>
+    </div>`;
+  }
+
+  // Architecture info
+  let archHTML = `<div class="glass-bright rounded-xl p-4">
+    <div class="text-xs text-gray-400 mb-3 font-medium">Architecture</div>
+    <div class="text-[11px] text-gray-500 space-y-1.5">
+      <div class="flex gap-2"><span class="text-gray-400 w-24">Call Flow:</span><span>Telnyx/WebRTC → <span class="text-white">:8003 Main Server</span> → Daily.co Room → Bot Process (per call)</span></div>
+      <div class="flex gap-2"><span class="text-gray-400 w-24">LLM:</span><span>Bot → <span class="text-white">H200 vLLM :8001</span> (Qwen3-VL-8B-Instruct)</span></div>
+      <div class="flex gap-2"><span class="text-gray-400 w-24">TTS:</span><span>Bot → <span class="text-white">H200 vLLM :8002</span> (recruite-tts-fp8)</span></div>
+      <div class="flex gap-2"><span class="text-gray-400 w-24">STT:</span><span>Bot → <span class="text-white">External Whisper</span> (GLM-ASR-Nano)</span></div>
+      <div class="flex gap-2"><span class="text-gray-400 w-24">Intent:</span><span>Bot → <span class="text-white">:8001 Voicemail Processor</span> (OpenRouter/Ministral-14B)</span></div>
+      <div class="flex gap-2"><span class="text-gray-400 w-24">Webhooks:</span><span>Bot → Caller's webhook URL (call events, transcripts, summaries)</span></div>
+    </div>
+  </div>`;
+
+  el.innerHTML = `<div class="glass rounded-2xl p-6">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center">
+          <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold text-white">AgentV2 — Voice Call Agent</h3>
+          <p class="text-[11px] text-gray-500">RTX 5090 Cluster &middot; 38.65.239.47</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        ${statusBadge}
+        <button onclick="loadAgent()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
+      </div>
+    </div>
+    ${kpiHTML}${svcHTML}${extHTML}${botsHTML}${gpuHTML}${archHTML}
+  </div>`;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -1464,6 +1809,7 @@ function renderAll() {
   else if (activeTab === 'history') renderHistory();
   else if (activeTab === 'software') renderSoftware();
   else if (activeTab === 'daily') renderDaily();
+  else if (activeTab === 'agent') renderAgent();
 }
 
 // ── Data Fetching ──

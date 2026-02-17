@@ -1,0 +1,10 @@
+{
+  "builds": [
+    { "src": "api/gpu.py", "use": "@vercel/python" },
+    { "src": "public/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/gpu", "dest": "/api/gpu.py" },
+    { "src": "/(.*)", "dest": "/public/$1" }
+  ]
+}

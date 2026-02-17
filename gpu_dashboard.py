@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import re
 from collections import deque
@@ -23,6 +24,12 @@ SERVERS = {
         "has_ecc": True,
         "vllm_ports": [8001, 8002],
         "local": True,
+        "venvs": {
+            "env_llm (primary)": "/home/ubuntu/env_llm/bin/pip",
+            "env (secondary)": "/home/ubuntu/env/bin/pip",
+        },
+        "services": ["vllm-llm", "vllm-tts"],
+        "agent_ports": [],
     },
     "rtx5090": {
         "name": "RTX 5090 Cluster",
@@ -33,6 +40,11 @@ SERVERS = {
         "has_ecc": False,
         "vllm_ports": [],
         "dcgm_port": 9400,
+        "venvs": {
+            "Agentv2-Old": "/home/ubuntu/.agent/Agentv2-Old/env/bin/pip",
+        },
+        "services": ["agentv2-main-server", "agentv2-voicemail-processor", "agentv2-failed-report", "agentv2-health-checker", "agentv2-server-old", "agent"],
+        "agent_ports": [8003],
     },
 }
 
@@ -224,6 +236,13 @@ async def fetch_gpu_data(server_key: str) -> dict:
             parts.append(f"echo '===VLLM_PORT_{server['vllm_ports'][i]}==='; {cmd}")
         vllm_combined = " && ".join(parts)
 
+    # Active connections on agent ports (for concurrent call tracking)
+    agent_ports = server.get("agent_ports", [])
+    conn_query = ""
+    if agent_ports:
+        port_filters = " ".join(f"sport = :{p}" for p in agent_ports)
+        conn_query = f"ss -tnp state established '( {port_filters} )' 2>/dev/null | tail -n +2 | wc -l"
+
     tasks = [
         run_command(server, gpu_query),
         run_command(server, proc_query),
@@ -232,13 +251,25 @@ async def fetch_gpu_data(server_key: str) -> dict:
     ]
     if vllm_combined:
         tasks.append(run_command(server, vllm_combined))
+    if conn_query:
+        tasks.append(run_command(server, conn_query))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     gpu_out = results[0] if not isinstance(results[0], Exception) else ""
     proc_out = results[1] if not isinstance(results[1], Exception) else ""
     sys_out = results[2] if not isinstance(results[2], Exception) else ""
     net_out = results[3] if not isinstance(results[3], Exception) else ""
-    vllm_out = results[4] if len(results) > 4 and not isinstance(results[4], Exception) else ""
+    idx = 4
+    vllm_out = ""
+    if vllm_combined:
+        vllm_out = results[idx] if not isinstance(results[idx], Exception) else ""
+        idx += 1
+    active_connections = 0
+    if conn_query:
+        try:
+            active_connections = int(results[idx].strip()) if not isinstance(results[idx], Exception) else 0
+        except (ValueError, IndexError):
+            active_connections = 0
 
     # Parse GPUs
     gpus = []
@@ -334,6 +365,7 @@ async def fetch_gpu_data(server_key: str) -> dict:
         "gpus": gpus,
         "processes": processes,
         "vllm": vllm_services,
+        "active_connections": active_connections,
         "status": "online",
     }
 
@@ -349,6 +381,7 @@ async def fetch_gpu_data(server_key: str) -> dict:
         "vram_pct": round(sum(g["mem_used"] for g in gpus) / max(sum(g["mem_total"] for g in gpus), 1) * 100, 1),
         "requests_running": total_running,
         "requests_waiting": total_waiting,
+        "active_connections": active_connections,
         "net_rx": net_rx,
         "net_tx": net_tx,
     })
@@ -377,6 +410,110 @@ async def get_history(server_key: str):
     if server_key not in SERVERS:
         return {"error": "Unknown server"}
     return {"history": list(history[server_key])}
+
+
+# ── Software Discovery ────────────────────────────────────────
+AI_PACKAGES = {
+    "vllm", "torch", "torchaudio", "torchvision", "transformers",
+    "flash-attn", "flashinfer-python", "triton", "safetensors",
+    "sentencepiece", "tokenizers", "huggingface-hub", "openai",
+    "anthropic", "accelerate", "bitsandbytes", "deepspeed",
+    "onnxruntime-gpu", "onnxruntime", "sentence-transformers",
+    "nvidia-nccl-cu12", "nvidia-cudnn-cu12", "nvidia-cublas-cu12",
+    "tts-rust", "whisper", "openai-whisper", "faster-whisper",
+    "nemo-toolkit", "langchain", "llama-cpp-python",
+}
+
+_software_cache = {}
+
+
+async def fetch_software(server_key: str) -> dict:
+    now = time.time()
+    if server_key in _software_cache and now - _software_cache[server_key]["_ts"] < 300:
+        return _software_cache[server_key]
+
+    server = SERVERS[server_key]
+
+    # System info
+    sys_cmd = (
+        "nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1; echo '==='; "
+        "nvcc --version 2>/dev/null | grep release; echo '==='; "
+        "uname -r; echo '==='; "
+        "python3 --version 2>&1; echo '==='; "
+        "systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | grep -E '"
+        + "|".join(server.get("services", []))
+        + "' || echo 'none'"
+    )
+
+    # Pip packages from each venv
+    venv_cmds = {}
+    for venv_name, pip_path in server.get("venvs", {}).items():
+        venv_cmds[venv_name] = f"{pip_path} list --format=json 2>/dev/null"
+
+    tasks = [run_command(server, sys_cmd)]
+    venv_keys = list(venv_cmds.keys())
+    for k in venv_keys:
+        tasks.append(run_command(server, venv_cmds[k]))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    sys_out = results[0] if not isinstance(results[0], Exception) else ""
+    sys_sections = sys_out.split("===")
+    driver = sys_sections[0].strip() if len(sys_sections) > 0 else "unknown"
+    cuda_line = sys_sections[1].strip() if len(sys_sections) > 1 else ""
+    cuda_ver = ""
+    if "release" in cuda_line:
+        cuda_ver = cuda_line.split("release")[-1].split(",")[0].strip()
+    kernel = sys_sections[2].strip() if len(sys_sections) > 2 else "unknown"
+    python_ver = sys_sections[3].strip() if len(sys_sections) > 3 else "unknown"
+    services_raw = sys_sections[4].strip() if len(sys_sections) > 4 else ""
+    services = []
+    for line in services_raw.split("\n"):
+        line = line.strip()
+        if line and line != "none":
+            parts = line.split()
+            svc_name = parts[0] if parts else line
+            status = "running" if "running" in line else "active"
+            services.append({"name": svc_name, "status": status})
+
+    # Parse pip packages
+    environments = {}
+    for i, venv_name in enumerate(venv_keys):
+        raw = results[i + 1] if not isinstance(results[i + 1], Exception) else "[]"
+        try:
+            pkgs = json.loads(raw)
+        except Exception:
+            pkgs = []
+        ai_pkgs = []
+        for p in pkgs:
+            name_lower = p.get("name", "").lower()
+            if name_lower in AI_PACKAGES or any(k in name_lower for k in ("nvidia", "cuda", "torch", "llm", "tts", "stt", "whisper", "triton")):
+                ai_pkgs.append({"name": p["name"], "version": p.get("version", "?")})
+        ai_pkgs.sort(key=lambda x: x["name"].lower())
+        environments[venv_name] = ai_pkgs
+
+    data = {
+        "_ts": now,
+        "server_name": server["name"],
+        "driver": driver,
+        "cuda": cuda_ver,
+        "kernel": kernel,
+        "python": python_ver,
+        "services": services,
+        "environments": environments,
+    }
+    _software_cache[server_key] = data
+    return data
+
+
+@app.get("/api/{server_key}/software")
+async def get_software(server_key: str):
+    if server_key not in SERVERS:
+        return {"error": "Unknown server"}
+    try:
+        return await asyncio.wait_for(fetch_software(server_key), timeout=20)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -454,6 +591,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-active pb-2 text-sm font-medium px-1" onclick="switchTab('overview')" id="tab-overview">Overview</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('traffic')" id="tab-traffic">Traffic & KPIs</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('history')" id="tab-history">History & Peaks</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('software')" id="tab-software">Software & Tools</button>
 </div>
 
 <!-- Content -->
@@ -461,6 +599,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-overview"></div>
   <div id="page-traffic" class="hidden"></div>
   <div id="page-history" class="hidden"></div>
+  <div id="page-software" class="hidden"></div>
 </div>
 
 <script>
@@ -471,6 +610,9 @@ let serverData = {};
 let historyData = {};
 let prevNetData = {};
 let activeTab = 'overview';
+let softwareData = {};
+let softwareLoaded = false;
+let pypiCache = {};
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -507,11 +649,12 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history'].forEach(t => {
+  ['overview','traffic','history','software'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
   renderAll();
+  if (tab === 'software' && !softwareLoaded) loadSoftware();
 }
 
 // ── Overview Tab ──
@@ -685,6 +828,8 @@ function renderHistory() {
     const powers = h.map(p=>p.total_power);
     const running = h.map(p=>p.requests_running);
     const waiting = h.map(p=>p.requests_waiting);
+    const connections = h.map(p=>p.active_connections||0);
+    const hasConnections = connections.some(c=>c>0);
 
     // Peak analysis
     const peakUtil = Math.max(...utils);
@@ -696,17 +841,56 @@ function renderHistory() {
     const peakRunIdx = running.indexOf(peakRunning);
     const peakRunTime = running.length > 0 ? new Date(h[peakRunIdx].t * 1000).toLocaleTimeString() : 'N/A';
     const peakWaiting = Math.max(...waiting);
+    const peakConns = Math.max(...connections);
+    const peakConnsIdx = connections.indexOf(peakConns);
+    const peakConnsTime = peakConnsIdx >= 0 ? new Date(h[peakConnsIdx].t * 1000).toLocaleTimeString() : 'N/A';
+    const currentConns = connections.length > 0 ? connections[connections.length-1] : 0;
 
     const avgUtil = (utils.reduce((a,b)=>a+b,0)/utils.length).toFixed(1);
     const avgTemp = (temps.reduce((a,b)=>a+b,0)/temps.length).toFixed(1);
+    const avgConns = connections.length > 0 ? (connections.reduce((a,b)=>a+b,0)/connections.length).toFixed(1) : '0';
 
     const duration = h.length > 1 ? ((h[h.length-1].t - h[0].t) / 60).toFixed(0) : 0;
+
+    // Concurrent calls section (for RTX 5090 / AgentV2)
+    let callsHTML = '';
+    if (hasConnections) {
+      callsHTML = `
+      <div class="glass-bright rounded-xl p-4 mb-5">
+        <div class="flex items-center gap-2 mb-3">
+          <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+          <span class="text-sm font-semibold text-white">Concurrent Calls (AgentV2)</span>
+          <span class="ml-auto text-xs px-2 py-0.5 rounded-full ${currentConns>0?'bg-emerald-500/20 text-emerald-400':'bg-gray-700/50 text-gray-500'}">${currentConns} active now</span>
+        </div>
+        <div class="grid grid-cols-3 gap-3 mb-3">
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent Calls</div>
+            <div class="text-2xl font-bold text-cyan-400">${peakConns}</div>
+            <div class="text-[10px] text-gray-500">at ${peakConnsTime}</div>
+          </div>
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Avg Concurrent Calls</div>
+            <div class="text-2xl font-bold text-gray-300">${avgConns}</div>
+            <div class="text-[10px] text-gray-500">over session</div>
+          </div>
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Current Active</div>
+            <div class="text-2xl font-bold ${currentConns>0?'text-emerald-400':'text-gray-500'}">${currentConns}</div>
+            <div class="text-[10px] text-gray-500">connections</div>
+          </div>
+        </div>
+        <div class="text-xs text-gray-400 mb-1">Concurrent Calls Over Time</div>
+        ${sparklineSVG(connections, 600, 50, '#06b6d4')}
+      </div>`;
+    }
 
     html += `<div class="glass rounded-2xl p-6 mb-6">
       <div class="flex items-center justify-between mb-4">
         <h3 class="text-lg font-semibold text-white">${d.server_name}</h3>
         <span class="text-xs text-gray-500">${h.length} samples over ${duration} min</span>
       </div>
+
+      ${callsHTML}
 
       <!-- Peak Cards -->
       <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
@@ -734,7 +918,7 @@ function renderHistory() {
           <div class="mt-1">${sparklineSVG(powers.slice(-60), 80, 20, '#f59e0b')}</div>
         </div>
         <div class="glass-bright rounded-lg p-3">
-          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent</div>
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak vLLM Active</div>
           <div class="text-xl font-bold text-cyan-400">${peakRunning}</div>
           <div class="text-[10px] text-gray-500">at ${peakRunTime}</div>
           <div class="mt-1">${sparklineSVG(running.slice(-60), 80, 20, '#06b6d4')}</div>
@@ -754,8 +938,8 @@ function renderHistory() {
           ${sparklineSVG(utils, 400, 60, '#22c55e')}
         </div>
         <div class="glass-bright rounded-xl p-4">
-          <div class="text-xs text-gray-400 mb-2">Active Requests Over Time</div>
-          ${sparklineSVG(running, 400, 60, '#06b6d4')}
+          <div class="text-xs text-gray-400 mb-2">${hasConnections ? 'Concurrent Calls Over Time' : 'Active Requests Over Time'}</div>
+          ${sparklineSVG(hasConnections ? connections : running, 400, 60, '#06b6d4')}
         </div>
         <div class="glass-bright rounded-xl p-4">
           <div class="text-xs text-gray-400 mb-2">Temperature Over Time</div>
@@ -772,11 +956,143 @@ function renderHistory() {
   el.innerHTML = html;
 }
 
+// ── Software & Tools Tab ──
+async function checkPyPI(pkgName) {
+  const normalized = pkgName.toLowerCase().replace(/_/g, '-');
+  if (pypiCache[normalized]) return pypiCache[normalized];
+  try {
+    const r = await fetch(`https://pypi.org/pypi/${normalized}/json`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const latest = d.info.version;
+    const summary = d.info.summary || '';
+    const projectUrl = d.info.project_url || d.info.package_url || '';
+    const releaseUrl = `https://pypi.org/project/${normalized}/${latest}/`;
+    pypiCache[normalized] = { latest, summary, releaseUrl };
+    return pypiCache[normalized];
+  } catch(e) { return null; }
+}
+
+function versionCompare(a, b) {
+  const pa = a.replace(/[^0-9.]/g,'').split('.').map(Number);
+  const pb = b.replace(/[^0-9.]/g,'').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i]||0, nb = pb[i]||0;
+    if (na < nb) return -1;
+    if (na > nb) return 1;
+  }
+  return 0;
+}
+
+async function loadSoftware() {
+  const el = document.getElementById('page-software');
+  el.innerHTML = '<div class="text-gray-500 text-center py-12"><div class="shimmer inline-block w-48 h-4 rounded mb-2"></div><div class="text-sm mt-2">Loading software inventory...</div></div>';
+  const [h200, rtx] = await Promise.all([
+    fetch('/api/h200/software').then(r=>r.json()).catch(()=>null),
+    fetch('/api/rtx5090/software').then(r=>r.json()).catch(()=>null),
+  ]);
+  softwareData.h200 = h200;
+  softwareData.rtx5090 = rtx;
+  softwareLoaded = true;
+  renderSoftware();
+}
+
+async function checkAllUpdates(serverKey) {
+  const sw = softwareData[serverKey];
+  if (!sw || !sw.environments) return;
+  for (const [envName, pkgs] of Object.entries(sw.environments)) {
+    for (const pkg of pkgs) {
+      const info = await checkPyPI(pkg.name);
+      if (info) {
+        pkg._latest = info.latest;
+        pkg._releaseUrl = info.releaseUrl;
+        pkg._hasUpdate = versionCompare(pkg.version, info.latest) < 0;
+      }
+    }
+  }
+  renderSoftware();
+}
+
+function renderSoftwareServer(key, sw) {
+  if (!sw || sw.error) {
+    return `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white">${key}</h3><p class="text-red-400 text-sm mt-2">${sw?.error||'Failed to load'}</p></div>`;
+  }
+
+  let sysHTML = `<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">NVIDIA Driver</div><div class="text-sm font-semibold text-white">${sw.driver}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">CUDA</div><div class="text-sm font-semibold text-white">${sw.cuda||'N/A'}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Kernel</div><div class="text-sm font-semibold text-white">${sw.kernel}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Python</div><div class="text-sm font-semibold text-white">${sw.python}</div></div>
+  </div>`;
+
+  // Services
+  let svcHTML = '';
+  if (sw.services && sw.services.length > 0) {
+    svcHTML = `<div class="mb-4"><div class="text-xs text-gray-400 mb-2 font-medium">Running Services</div><div class="flex flex-wrap gap-2">${sw.services.map(s=>`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>${s.name}</span>`).join('')}</div></div>`;
+  }
+
+  // Environments
+  let envHTML = '';
+  for (const [envName, pkgs] of Object.entries(sw.environments || {})) {
+    const hasAnyUpdate = pkgs.some(p => p._hasUpdate);
+    const checkedUpdates = pkgs.some(p => p._latest !== undefined);
+    envHTML += `<div class="glass-bright rounded-xl p-4 mb-3">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium text-white">${envName}</div>
+        <div class="flex items-center gap-2">
+          ${hasAnyUpdate ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">${pkgs.filter(p=>p._hasUpdate).length} updates available</span>` : ''}
+          <span class="text-[10px] text-gray-500">${pkgs.length} packages</span>
+        </div>
+      </div>
+      <table class="w-full text-xs">
+        <thead><tr class="text-gray-500 border-b border-gray-700/50">
+          <th class="text-left py-1.5 font-medium">Package</th>
+          <th class="text-left py-1.5 font-medium">Installed</th>
+          <th class="text-left py-1.5 font-medium">Latest</th>
+          <th class="text-right py-1.5 font-medium">Actions</th>
+        </tr></thead>
+        <tbody>${pkgs.map(p => {
+          const hasUpdate = p._hasUpdate;
+          const latest = p._latest || (checkedUpdates ? p.version : '-');
+          const rowClass = hasUpdate ? 'bg-amber-500/5' : '';
+          return `<tr class="${rowClass} border-b border-gray-800/30 hover:bg-white/[0.02]">
+            <td class="py-1.5 text-gray-300 font-medium">${p.name}</td>
+            <td class="py-1.5 ${hasUpdate?'text-amber-400':'text-gray-400'}">${p.version}</td>
+            <td class="py-1.5 ${hasUpdate?'text-emerald-400':'text-gray-500'}">${latest}</td>
+            <td class="py-1.5 text-right">
+              ${p._releaseUrl ? `<a href="${p._releaseUrl}" target="_blank" title="Release notes" class="inline-flex items-center justify-center w-6 h-6 rounded hover:bg-white/10 text-gray-500 hover:text-blue-400"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg></a>` : ''}
+              ${hasUpdate ? `<span title="Update available — run: pip install ${p.name}==${p._latest}" class="inline-flex items-center justify-center w-6 h-6 rounded hover:bg-white/10 text-amber-400 hover:text-amber-300 cursor-pointer"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg></span>` : ''}
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+  }
+
+  return `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-lg font-semibold text-white">${sw.server_name}</h3>
+      <button onclick="checkAllUpdates('${key}')" class="text-xs px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition-colors">Check for Updates</button>
+    </div>
+    ${sysHTML}${svcHTML}${envHTML}
+  </div>`;
+}
+
+function renderSoftware() {
+  const el = document.getElementById('page-software');
+  if (!softwareLoaded) {
+    el.innerHTML = '<div class="text-gray-500 text-center py-12">Click the Software & Tools tab to load inventory</div>';
+    return;
+  }
+  el.innerHTML = SERVERS.map(k => renderSoftwareServer(k, softwareData[k])).join('');
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
   else if (activeTab === 'traffic') renderTraffic();
   else if (activeTab === 'history') renderHistory();
+  else if (activeTab === 'software') renderSoftware();
 }
 
 // ── Data Fetching ──

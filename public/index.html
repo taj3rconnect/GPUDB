@@ -25,13 +25,17 @@
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+  canvas { image-rendering: pixelated; }
   .tab-active { border-bottom: 2px solid #22c55e; color: #fff; }
   .tab-inactive { border-bottom: 2px solid transparent; color: #6b7280; }
   .tab-inactive:hover { color: #9ca3af; }
   .kpi-card { transition: all 0.2s ease; }
   .kpi-card:hover { background: rgba(255,255,255,0.06); }
+  .sparkline { display: inline-block; vertical-align: middle; }
 </style>
-<script>tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#111118', 200:'#1a1a24' } } } } }</script>
+<script>
+tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#111118', 200:'#1a1a24' } } } } }
+</script>
 </head>
 <body class="min-h-screen text-gray-200 p-4 md:p-6">
 
@@ -50,10 +54,9 @@
     <div class="flex items-center gap-4">
       <div class="text-xs text-gray-500">
         Refresh: <select id="refreshRate" onchange="updateRefreshRate()" class="bg-surface-100 border border-gray-700 rounded px-2 py-1 text-gray-300 text-xs">
-          <option value="5000">5s</option><option value="10000">10s</option><option value="30000" selected>30s</option><option value="60000">60s</option>
+          <option value="3000">3s</option><option value="5000">5s</option><option value="10000">10s</option><option value="30000">30s</option>
         </select>
       </div>
-      <button onclick="clearHistory()" class="text-[10px] text-gray-600 hover:text-gray-400 px-2 py-1 rounded border border-gray-800 hover:border-gray-600">Clear History</button>
       <div id="lastUpdate" class="text-xs text-gray-500"></div>
     </div>
   </div>
@@ -64,6 +67,7 @@
   <button class="tab-active pb-2 text-sm font-medium px-1" onclick="switchTab('overview')" id="tab-overview">Overview</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('traffic')" id="tab-traffic">Traffic & KPIs</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('history')" id="tab-history">History & Peaks</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('software')" id="tab-software">Software & Tools</button>
 </div>
 
 <!-- Content -->
@@ -71,28 +75,21 @@
   <div id="page-overview"></div>
   <div id="page-traffic" class="hidden"></div>
   <div id="page-history" class="hidden"></div>
+  <div id="page-software" class="hidden"></div>
 </div>
 
 <script>
-const SERVERS = ['h200','rtx5090'];
+const SERVERS = ['h200', 'rtx5090'];
 let refreshInterval = null;
-let refreshRate = 30000;
+let refreshRate = 3000;
 let serverData = {};
+let historyData = {};
 let prevNetData = {};
 let activeTab = 'overview';
-const MAX_HIST = 2880;
-
-// ── LocalStorage History ──
-function loadHistory(key) {
-  try { return JSON.parse(localStorage.getItem('gpu_hist_'+key) || '[]'); } catch(e) { return []; }
-}
-function saveHistory(key, data) {
-  try { localStorage.setItem('gpu_hist_'+key, JSON.stringify(data.slice(-MAX_HIST))); } catch(e) {}
-}
-function clearHistory() {
-  SERVERS.forEach(k => localStorage.removeItem('gpu_hist_'+k));
-  renderAll();
-}
+let softwareData = {};
+let softwareLoaded = false;
+let pypiCache = {};
+const API_BASE = 'http://146.88.194.12:8080';
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -113,21 +110,28 @@ function barHTML(v,m,c) { const p=m>0?Math.min((v/m)*100,100):0; return `<div cl
 
 function sparklineSVG(data, width, height, color) {
   if (!data || data.length < 2) return '';
-  const max = Math.max(...data, 1), min = Math.min(...data, 0), range = max - min || 1;
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data, 0);
+  const range = max - min || 1;
   const step = width / (data.length - 1);
   let path = '';
-  data.forEach((v, i) => { const x = i * step; const y = height - ((v - min) / range) * (height - 4) - 2; path += (i===0?'M':'L') + x.toFixed(1) + ',' + y.toFixed(1); });
-  return `<svg width="${width}" height="${height}" style="display:inline-block;vertical-align:middle"><path d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  data.forEach((v, i) => {
+    const x = i * step;
+    const y = height - ((v - min) / range) * (height - 4) - 2;
+    path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  return `<svg width="${width}" height="${height}" class="sparkline"><path d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history'].forEach(t => {
+  ['overview','traffic','history','software'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
   renderAll();
+  if (tab === 'software' && !softwareLoaded) loadSoftware();
 }
 
 // ── Overview Tab ──
@@ -136,39 +140,69 @@ function renderGPUCard(g, hasEcc) {
   const pp=g.power_limit>0?(g.power_draw/g.power_limit*100):0, pc=getPowerColor(pp);
   const mp=g.mem_total>0?(g.mem_used/g.mem_total*100):0, mc=getColor(mp,[60,90]);
   return `<div class="gpu-card glass-bright rounded-xl p-4">
-    <div class="flex items-center justify-between mb-3"><span class="text-xs font-medium text-gray-400">GPU ${g.index}</span>
-      <div class="flex items-center gap-2">${g.fan!==null?`<span class="text-[10px] text-gray-500">${g.fan}% fan</span>`:''} ${hasEcc&&g.ecc_errors!==undefined?`<span class="text-[10px] ${g.ecc_errors>0?'text-red-400':'text-gray-600'}">ECC:${g.ecc_errors}</span>`:''}</div>
+    <div class="flex items-center justify-between mb-3">
+      <span class="text-xs font-medium text-gray-400">GPU ${g.index}</span>
+      <div class="flex items-center gap-2">
+        ${g.fan!==null?`<span class="text-[10px] text-gray-500">${g.fan}% fan</span>`:''}
+        ${hasEcc&&g.ecc_errors!==undefined?`<span class="text-[10px] ${g.ecc_errors>0?'text-red-400':'text-gray-600'}">ECC:${g.ecc_errors}</span>`:''}
+      </div>
     </div>
     <div class="flex items-center gap-4 mb-3">
-      <div class="relative flex-shrink-0">${ringSVG(g.gpu_util,100,64,5,uc.ring)}<div class="absolute inset-0 flex items-center justify-center"><span class="text-sm font-semibold ${uc.text}">${g.gpu_util}%</span></div></div>
+      <div class="relative flex-shrink-0">${ringSVG(g.gpu_util,100,64,5,uc.ring)}
+        <div class="absolute inset-0 flex items-center justify-center"><span class="text-sm font-semibold ${uc.text}">${g.gpu_util}%</span></div>
+      </div>
       <div class="flex-1 space-y-1.5">
         <div class="flex justify-between text-[11px]"><span class="text-gray-500">Temp</span><span class="${tc.text} font-medium">${g.temp!==null?g.temp+'°C':'N/A'}</span></div>
         <div class="flex justify-between text-[11px]"><span class="text-gray-500">Power</span><span class="${pc.text} font-medium">${g.power_draw.toFixed(0)}W/${g.power_limit.toFixed(0)}W</span></div>
       </div>
     </div>
-    <div class="space-y-1.5"><div class="flex items-center justify-between text-[11px]"><span class="text-gray-500">VRAM</span><span class="text-gray-400">${formatMiB(g.mem_used)}/${formatMiB(g.mem_total)}</span></div>${barHTML(g.mem_used,g.mem_total,mc.ring)}</div>
+    <div class="space-y-1.5">
+      <div class="flex items-center justify-between text-[11px]"><span class="text-gray-500">VRAM</span><span class="text-gray-400">${formatMiB(g.mem_used)}/${formatMiB(g.mem_total)}</span></div>
+      ${barHTML(g.mem_used,g.mem_total,mc.ring)}
+    </div>
   </div>`;
 }
 
 function renderOverviewServer(key, d) {
   if (!d || d.status==='offline') {
-    return `<div class="glass rounded-2xl p-6"><div class="flex items-center gap-3 mb-4"><div class="w-2.5 h-2.5 rounded-full bg-red-500 status-offline"></div><h2 class="text-lg font-semibold text-white">${d?.server_name||key}</h2><span class="text-xs text-gray-500">${d?.host||''}</span></div><div class="text-red-400 text-sm">${d?.error?'Connection failed: '+d.error:'Connecting...'}</div></div>`;
+    return `<div class="glass rounded-2xl p-6"><div class="flex items-center gap-3 mb-4"><div class="w-2.5 h-2.5 rounded-full bg-red-500 status-offline"></div><h2 class="text-lg font-semibold text-white">${d?.server_name||key}</h2><span class="text-xs text-gray-500">${d?.host||''}</span></div><div class="text-red-400 text-sm">Connection failed: ${d?.error||'Unknown'}</div></div>`;
   }
   const gpus=d.gpus||[], procs=d.processes||[];
   const tv=gpus.reduce((s,g)=>s+g.mem_total,0), uv=gpus.reduce((s,g)=>s+g.mem_used,0);
   const au=gpus.length?Math.round(gpus.reduce((s,g)=>s+g.gpu_util,0)/gpus.length):0;
   const tp=gpus.reduce((s,g)=>s+g.power_draw,0), tc=gpus.reduce((s,g)=>s+g.power_limit,0);
   const vp=tv>0?((uv/tv)*100).toFixed(0):0;
+
+  // System bars
   let sys='';
   if(d.ram?.total){sys+=`<div class="flex items-center gap-2"><span class="text-gray-500 text-xs w-12">RAM</span><div class="flex-1">${barHTML(d.ram.used,d.ram.total,'#6366f1')}</div><span class="text-xs text-gray-400 w-28 text-right">${formatBytes(d.ram.used)} / ${formatBytes(d.ram.total)}</span></div>`;}
   if(d.disk?.total){sys+=`<div class="flex items-center gap-2"><span class="text-gray-500 text-xs w-12">Disk</span><div class="flex-1">${barHTML(d.disk.used,d.disk.total,'#8b5cf6')}</div><span class="text-xs text-gray-400 w-28 text-right">${formatBytes(d.disk.used)} / ${formatBytes(d.disk.total)}</span></div>`;}
-  let netHtml='';
-  if(prevNetData[key]){const dt=(d.timestamp-prevNetData[key].t)||1;const rx=((d.net_rx_bytes-prevNetData[key].rx)*8)/dt;const tx=((d.net_tx_bytes-prevNetData[key].tx)*8)/dt;if(rx>=0&&tx>=0)netHtml=`<div class="flex items-center gap-4 text-[11px] mt-1"><span class="text-gray-500">Net:</span><span class="text-cyan-400">↓ ${formatRate(rx)}</span><span class="text-emerald-400">↑ ${formatRate(tx)}</span></div>`;}
-  prevNetData[key]={t:d.timestamp,rx:d.net_rx_bytes,tx:d.net_tx_bytes};
+
+  // Net throughput
+  let netHtml = '';
+  if (prevNetData[key]) {
+    const dt = (d.timestamp - prevNetData[key].t) || 1;
+    const rxRate = ((d.net_rx_bytes - prevNetData[key].rx) * 8) / dt;
+    const txRate = ((d.net_tx_bytes - prevNetData[key].tx) * 8) / dt;
+    if (rxRate >= 0 && txRate >= 0) {
+      netHtml = `<div class="flex items-center gap-4 text-[11px] mt-1"><span class="text-gray-500">Net:</span><span class="text-cyan-400">↓ ${formatRate(rxRate)}</span><span class="text-emerald-400">↑ ${formatRate(txRate)}</span></div>`;
+    }
+  }
+  prevNetData[key] = { t: d.timestamp, rx: d.net_rx_bytes, tx: d.net_tx_bytes };
+
+  // Procs
   let procHTML='';
-  if(procs.length>0){const up={};procs.forEach(p=>{const k=p.pid+p.name;if(!up[k])up[k]={...p,count:1};else{up[k].mem_used+=p.mem_used;up[k].count++;}});const pl=Object.values(up).sort((a,b)=>b.mem_used-a.mem_used).slice(0,8);procHTML=`<details class="mt-4"><summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Processes (${procs.length})</summary><div class="mt-2 space-y-1">${pl.map(p=>`<div class="flex justify-between text-[11px] text-gray-400 py-1 px-2 rounded hover:bg-white/[0.03]"><span class="truncate flex-1 mr-2">${p.name}</span><span class="text-gray-500 flex-shrink-0">PID ${p.pid} · ${formatMiB(p.mem_used)}</span></div>`).join('')}</div></details>`;}
+  if(procs.length>0){
+    const up={};procs.forEach(p=>{const k=p.pid+p.name;if(!up[k])up[k]={...p,count:1};else{up[k].mem_used+=p.mem_used;up[k].count++;}});
+    const pl=Object.values(up).sort((a,b)=>b.mem_used-a.mem_used).slice(0,8);
+    procHTML=`<details class="mt-4"><summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Processes (${procs.length})</summary><div class="mt-2 space-y-1">${pl.map(p=>`<div class="flex justify-between text-[11px] text-gray-400 py-1 px-2 rounded hover:bg-white/[0.03]"><span class="truncate flex-1 mr-2" title="${p.name}">${p.name}</span><span class="text-gray-500 flex-shrink-0">PID ${p.pid} · ${formatMiB(p.mem_used)}</span></div>`).join('')}</div></details>`;
+  }
+
   return `<div class="glass rounded-2xl p-6">
-    <div class="flex items-center justify-between mb-4"><div class="flex items-center gap-3"><div class="w-2.5 h-2.5 rounded-full bg-emerald-500 status-online"></div><h2 class="text-lg font-semibold text-white">${d.server_name}</h2><span class="text-xs text-gray-500 font-mono">${d.host}</span></div><div class="text-xs text-gray-500">up ${formatUptime(d.uptime_seconds)}</div></div>
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3"><div class="w-2.5 h-2.5 rounded-full bg-emerald-500 status-online"></div><h2 class="text-lg font-semibold text-white">${d.server_name}</h2><span class="text-xs text-gray-500 font-mono">${d.host}</span></div>
+      <div class="text-xs text-gray-500">up ${formatUptime(d.uptime_seconds)}</div>
+    </div>
     <div class="grid grid-cols-4 gap-3 mb-4">
       <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">GPUs</div><div class="text-lg font-semibold text-white">${gpus.length}</div><div class="text-[10px] text-gray-500">${d.gpu_model.replace('NVIDIA ','').replace('GeForce ','')}</div></div>
       <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Avg Util</div><div class="text-lg font-semibold ${getUtilColor(au).text}">${au}%</div><div class="text-[10px] text-gray-500">compute</div></div>
@@ -176,21 +210,26 @@ function renderOverviewServer(key, d) {
       <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Power</div><div class="text-lg font-semibold ${getPowerColor(tc>0?tp/tc*100:0).text}">${tp.toFixed(0)}W</div><div class="text-[10px] text-gray-500">/ ${tc.toFixed(0)}W cap</div></div>
     </div>
     <div class="space-y-2 mb-4">${sys}${netHtml}</div>
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">${gpus.map(g=>renderGPUCard(g,d.gpu_model.includes('H200'))).join('')}</div>
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">${gpus.map(g=>renderGPUCard(g, d.gpu_model.includes('H200'))).join('')}</div>
     ${procHTML}
   </div>`;
 }
 
 function renderOverview() {
-  document.getElementById('page-overview').innerHTML = `<div class="grid grid-cols-1 2xl:grid-cols-2 gap-6">${SERVERS.map(k=>renderOverviewServer(k,serverData[k])).join('')}</div>`;
+  const el = document.getElementById('page-overview');
+  el.innerHTML = `<div class="grid grid-cols-1 2xl:grid-cols-2 gap-6">${SERVERS.map(k => renderOverviewServer(k, serverData[k])).join('')}</div>`;
 }
 
-// ── Traffic Tab ──
+// ── Traffic & KPIs Tab ──
 function renderVllmService(v) {
-  const sm=v.model_name.split('/').pop();
+  const shortModel = v.model_name.split('/').pop();
   return `<div class="glass-bright rounded-xl p-4">
-    <div class="flex items-center justify-between mb-3"><div><span class="text-sm font-medium text-white">${sm}</span><span class="text-[10px] text-gray-500 ml-2">:${v.port}</span></div>
-      <div class="flex items-center gap-2"><span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${v.requests_running>0?'bg-emerald-500/20 text-emerald-400':'bg-gray-700/50 text-gray-500'}">${v.requests_running} running</span><span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${v.requests_waiting>0?'bg-amber-500/20 text-amber-400':'bg-gray-700/50 text-gray-500'}">${v.requests_waiting} queued</span></div>
+    <div class="flex items-center justify-between mb-3">
+      <div><span class="text-sm font-medium text-white">${shortModel}</span><span class="text-[10px] text-gray-500 ml-2">:${v.port}</span></div>
+      <div class="flex items-center gap-2">
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${v.requests_running>0?'bg-emerald-500/20 text-emerald-400':'bg-gray-700/50 text-gray-500'}">${v.requests_running} running</span>
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${v.requests_waiting>0?'bg-amber-500/20 text-amber-400':'bg-gray-700/50 text-gray-500'}">${v.requests_waiting} queued</span>
+      </div>
     </div>
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
       <div class="kpi-card rounded-lg p-2.5 bg-white/[0.02]"><div class="text-[10px] text-gray-500 mb-0.5">Total Requests</div><div class="text-base font-semibold text-white">${fmt(v.total_requests)}</div></div>
@@ -212,98 +251,366 @@ function renderVllmService(v) {
 }
 
 function renderTraffic() {
-  const el=document.getElementById('page-traffic'); let html='';
-  for(const key of SERVERS){const d=serverData[key];if(!d||d.status==='offline')continue;const vllm=d.vllm||[];
-    if(!vllm.length){html+=`<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white mb-2">${d.server_name}</h3><p class="text-gray-500 text-sm">No vLLM services detected on this server</p></div>`;continue;}
-    const tr=vllm.reduce((s,v)=>s+v.total_requests,0),tp=vllm.reduce((s,v)=>s+v.prompt_tokens,0),tg=vllm.reduce((s,v)=>s+v.generation_tokens,0),trn=vllm.reduce((s,v)=>s+v.requests_running,0),tw=vllm.reduce((s,v)=>s+v.requests_waiting,0);
-    html+=`<div class="glass rounded-2xl p-6 mb-6"><div class="flex items-center justify-between mb-4 flex-wrap gap-2"><div class="flex items-center gap-3"><div class="w-2.5 h-2.5 rounded-full bg-emerald-500 status-online"></div><h3 class="text-lg font-semibold text-white">${d.server_name}</h3></div><div class="flex gap-4 text-xs flex-wrap"><span class="text-gray-400">Total: <span class="text-white font-semibold">${fmt(tr)}</span> reqs</span><span class="text-gray-400">Prompt: <span class="text-cyan-400 font-semibold">${(tp/1e6).toFixed(1)}M</span> tok</span><span class="text-gray-400">Gen: <span class="text-purple-400 font-semibold">${(tg/1e6).toFixed(1)}M</span> tok</span><span class="text-gray-400">Active: <span class="text-emerald-400 font-semibold">${trn}</span></span><span class="text-gray-400">Queued: <span class="${tw>0?'text-amber-400':'text-gray-500'} font-semibold">${tw}</span></span></div></div><div class="grid grid-cols-1 xl:grid-cols-2 gap-4">${vllm.map(v=>renderVllmService(v)).join('')}</div></div>`;
+  const el = document.getElementById('page-traffic');
+  let html = '';
+  for (const key of SERVERS) {
+    const d = serverData[key];
+    if (!d || d.status === 'offline') continue;
+    const vllm = d.vllm || [];
+    if (vllm.length === 0) {
+      html += `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white mb-2">${d.server_name}</h3><p class="text-gray-500 text-sm">No vLLM services detected</p></div>`;
+      continue;
+    }
+    // Aggregate KPIs
+    const totalReqs = vllm.reduce((s,v)=>s+v.total_requests,0);
+    const totalPrompt = vllm.reduce((s,v)=>s+v.prompt_tokens,0);
+    const totalGen = vllm.reduce((s,v)=>s+v.generation_tokens,0);
+    const totalRunning = vllm.reduce((s,v)=>s+v.requests_running,0);
+    const totalWaiting = vllm.reduce((s,v)=>s+v.requests_waiting,0);
+
+    html += `<div class="glass rounded-2xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-3"><div class="w-2.5 h-2.5 rounded-full bg-emerald-500 status-online"></div><h3 class="text-lg font-semibold text-white">${d.server_name}</h3></div>
+        <div class="flex gap-4 text-xs">
+          <span class="text-gray-400">Total: <span class="text-white font-semibold">${fmt(totalReqs)}</span> reqs</span>
+          <span class="text-gray-400">Prompt: <span class="text-cyan-400 font-semibold">${(totalPrompt/1e6).toFixed(1)}M</span> tok</span>
+          <span class="text-gray-400">Gen: <span class="text-purple-400 font-semibold">${(totalGen/1e6).toFixed(1)}M</span> tok</span>
+          <span class="text-gray-400">Active: <span class="text-emerald-400 font-semibold">${totalRunning}</span></span>
+          <span class="text-gray-400">Queued: <span class="${totalWaiting>0?'text-amber-400':'text-gray-500'} font-semibold">${totalWaiting}</span></span>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">${vllm.map(v=>renderVllmService(v)).join('')}</div>
+    </div>`;
   }
-  if(!html) html='<div class="text-gray-500 text-center py-12">Loading traffic data...</div>';
-  el.innerHTML=html;
+  if (!html) html = '<div class="text-gray-500 text-center py-12">Loading traffic data...</div>';
+  el.innerHTML = html;
 }
 
-// ── History Tab ──
+// ── History & Peaks Tab ──
 function renderHistory() {
-  const el=document.getElementById('page-history'); let html='';
-  for(const key of SERVERS){
-    const h=loadHistory(key); const d=serverData[key];
-    if(!d||d.status==='offline')continue;
-    if(h.length<2){html+=`<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white mb-2">${d.server_name}</h3><p class="text-gray-500 text-sm">Collecting data... (${h.length} samples so far)</p></div>`;continue;}
-    const utils=h.map(p=>p.u),temps=h.map(p=>p.t2),powers=h.map(p=>p.pw),running=h.map(p=>p.rn||0),waiting=h.map(p=>p.wt||0);
-    const peakUtil=Math.max(...utils),piU=utils.indexOf(peakUtil),ptU=new Date(h[piU].ts*1000).toLocaleTimeString();
-    const peakTemp=Math.max(...temps),peakPower=Math.max(...powers);
-    const peakRun=Math.max(...running),piR=running.indexOf(peakRun),ptR=new Date(h[piR].ts*1000).toLocaleTimeString();
-    const peakWait=Math.max(...waiting);
-    const avgU=(utils.reduce((a,b)=>a+b,0)/utils.length).toFixed(1);
-    const avgT=(temps.reduce((a,b)=>a+b,0)/temps.length).toFixed(1);
-    const dur=h.length>1?((h[h.length-1].ts-h[0].ts)/60).toFixed(0):0;
-    html+=`<div class="glass rounded-2xl p-6 mb-6">
-      <div class="flex items-center justify-between mb-4"><h3 class="text-lg font-semibold text-white">${d.server_name}</h3><span class="text-xs text-gray-500">${h.length} samples over ${dur} min</span></div>
-      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Peak GPU Util</div><div class="text-xl font-bold ${getUtilColor(peakUtil).text}">${peakUtil}%</div><div class="text-[10px] text-gray-500">at ${ptU}</div><div class="mt-1">${sparklineSVG(utils.slice(-60),80,20,getUtilColor(peakUtil).ring)}</div></div>
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Avg GPU Util</div><div class="text-xl font-bold ${getUtilColor(parseFloat(avgU)).text}">${avgU}%</div><div class="text-[10px] text-gray-500">over session</div></div>
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Peak Temp</div><div class="text-xl font-bold ${getTempColor(peakTemp).text}">${peakTemp}°C</div><div class="text-[10px] text-gray-500">avg ${avgT}°C</div><div class="mt-1">${sparklineSVG(temps.slice(-60),80,20,getTempColor(peakTemp).ring)}</div></div>
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Peak Power</div><div class="text-xl font-bold text-amber-400">${peakPower.toFixed(0)}W</div><div class="text-[10px] text-gray-500">cluster total</div><div class="mt-1">${sparklineSVG(powers.slice(-60),80,20,'#f59e0b')}</div></div>
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent</div><div class="text-xl font-bold text-cyan-400">${peakRun}</div><div class="text-[10px] text-gray-500">at ${ptR}</div><div class="mt-1">${sparklineSVG(running.slice(-60),80,20,'#06b6d4')}</div></div>
-        <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Peak Queued</div><div class="text-xl font-bold ${peakWait>0?'text-amber-400':'text-gray-500'}">${peakWait}</div><div class="text-[10px] text-gray-500">max waiting</div><div class="mt-1">${sparklineSVG(waiting.slice(-60),80,20,'#f59e0b')}</div></div>
+  const el = document.getElementById('page-history');
+  let html = '';
+  for (const key of SERVERS) {
+    const h = historyData[key] || [];
+    const d = serverData[key];
+    if (!d || d.status === 'offline') continue;
+
+    if (h.length < 2) {
+      html += `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white mb-2">${d.server_name}</h3><p class="text-gray-500 text-sm">Collecting data... (${h.length} samples so far)</p></div>`;
+      continue;
+    }
+
+    const utils = h.map(p=>p.avg_util);
+    const temps = h.map(p=>p.max_temp);
+    const powers = h.map(p=>p.total_power);
+    const running = h.map(p=>p.requests_running);
+    const waiting = h.map(p=>p.requests_waiting);
+    const connections = h.map(p=>p.active_connections||0);
+    const hasConnections = connections.some(c=>c>0);
+
+    // Peak analysis
+    const peakUtil = Math.max(...utils);
+    const peakUtilIdx = utils.indexOf(peakUtil);
+    const peakUtilTime = new Date(h[peakUtilIdx].t * 1000).toLocaleTimeString();
+    const peakTemp = Math.max(...temps);
+    const peakPower = Math.max(...powers);
+    const peakRunning = Math.max(...running);
+    const peakRunIdx = running.indexOf(peakRunning);
+    const peakRunTime = running.length > 0 ? new Date(h[peakRunIdx].t * 1000).toLocaleTimeString() : 'N/A';
+    const peakWaiting = Math.max(...waiting);
+    const peakConns = Math.max(...connections);
+    const peakConnsIdx = connections.indexOf(peakConns);
+    const peakConnsTime = peakConnsIdx >= 0 ? new Date(h[peakConnsIdx].t * 1000).toLocaleTimeString() : 'N/A';
+    const currentConns = connections.length > 0 ? connections[connections.length-1] : 0;
+
+    const avgUtil = (utils.reduce((a,b)=>a+b,0)/utils.length).toFixed(1);
+    const avgTemp = (temps.reduce((a,b)=>a+b,0)/temps.length).toFixed(1);
+    const avgConns = connections.length > 0 ? (connections.reduce((a,b)=>a+b,0)/connections.length).toFixed(1) : '0';
+
+    const duration = h.length > 1 ? ((h[h.length-1].t - h[0].t) / 60).toFixed(0) : 0;
+
+    // Concurrent calls section (for RTX 5090 / AgentV2)
+    let callsHTML = '';
+    if (hasConnections) {
+      callsHTML = `
+      <div class="glass-bright rounded-xl p-4 mb-5">
+        <div class="flex items-center gap-2 mb-3">
+          <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+          <span class="text-sm font-semibold text-white">Concurrent Calls (AgentV2)</span>
+          <span class="ml-auto text-xs px-2 py-0.5 rounded-full ${currentConns>0?'bg-emerald-500/20 text-emerald-400':'bg-gray-700/50 text-gray-500'}">${currentConns} active now</span>
+        </div>
+        <div class="grid grid-cols-3 gap-3 mb-3">
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Concurrent Calls</div>
+            <div class="text-2xl font-bold text-cyan-400">${peakConns}</div>
+            <div class="text-[10px] text-gray-500">at ${peakConnsTime}</div>
+          </div>
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Avg Concurrent Calls</div>
+            <div class="text-2xl font-bold text-gray-300">${avgConns}</div>
+            <div class="text-[10px] text-gray-500">over session</div>
+          </div>
+          <div class="bg-white/[0.02] rounded-lg p-3 text-center">
+            <div class="text-[10px] text-gray-500 uppercase mb-1">Current Active</div>
+            <div class="text-2xl font-bold ${currentConns>0?'text-emerald-400':'text-gray-500'}">${currentConns}</div>
+            <div class="text-[10px] text-gray-500">connections</div>
+          </div>
+        </div>
+        <div class="text-xs text-gray-400 mb-1">Concurrent Calls Over Time</div>
+        ${sparklineSVG(connections, 600, 50, '#06b6d4')}
+      </div>`;
+    }
+
+    html += `<div class="glass rounded-2xl p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold text-white">${d.server_name}</h3>
+        <span class="text-xs text-gray-500">${h.length} samples over ${duration} min</span>
       </div>
+
+      ${callsHTML}
+
+      <!-- Peak Cards -->
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak GPU Util</div>
+          <div class="text-xl font-bold ${getUtilColor(peakUtil).text}">${peakUtil}%</div>
+          <div class="text-[10px] text-gray-500">at ${peakUtilTime}</div>
+          <div class="mt-1">${sparklineSVG(utils.slice(-60), 80, 20, getUtilColor(peakUtil).ring)}</div>
+        </div>
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Avg GPU Util</div>
+          <div class="text-xl font-bold ${getUtilColor(parseFloat(avgUtil)).text}">${avgUtil}%</div>
+          <div class="text-[10px] text-gray-500">over session</div>
+        </div>
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Temp</div>
+          <div class="text-xl font-bold ${getTempColor(peakTemp).text}">${peakTemp}°C</div>
+          <div class="text-[10px] text-gray-500">avg ${avgTemp}°C</div>
+          <div class="mt-1">${sparklineSVG(temps.slice(-60), 80, 20, getTempColor(peakTemp).ring)}</div>
+        </div>
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Power</div>
+          <div class="text-xl font-bold text-amber-400">${peakPower.toFixed(0)}W</div>
+          <div class="text-[10px] text-gray-500">cluster total</div>
+          <div class="mt-1">${sparklineSVG(powers.slice(-60), 80, 20, '#f59e0b')}</div>
+        </div>
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak vLLM Active</div>
+          <div class="text-xl font-bold text-cyan-400">${peakRunning}</div>
+          <div class="text-[10px] text-gray-500">at ${peakRunTime}</div>
+          <div class="mt-1">${sparklineSVG(running.slice(-60), 80, 20, '#06b6d4')}</div>
+        </div>
+        <div class="glass-bright rounded-lg p-3">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Peak Queued</div>
+          <div class="text-xl font-bold ${peakWaiting>0?'text-amber-400':'text-gray-500'}">${peakWaiting}</div>
+          <div class="text-[10px] text-gray-500">max waiting</div>
+          <div class="mt-1">${sparklineSVG(waiting.slice(-60), 80, 20, '#f59e0b')}</div>
+        </div>
+      </div>
+
+      <!-- Sparkline Charts -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="glass-bright rounded-xl p-4"><div class="text-xs text-gray-400 mb-2">GPU Utilization</div>${sparklineSVG(utils,400,60,'#22c55e')}</div>
-        <div class="glass-bright rounded-xl p-4"><div class="text-xs text-gray-400 mb-2">Active Requests</div>${sparklineSVG(running,400,60,'#06b6d4')}</div>
-        <div class="glass-bright rounded-xl p-4"><div class="text-xs text-gray-400 mb-2">Temperature</div>${sparklineSVG(temps,400,60,'#ef4444')}</div>
-        <div class="glass-bright rounded-xl p-4"><div class="text-xs text-gray-400 mb-2">Power Draw</div>${sparklineSVG(powers,400,60,'#f59e0b')}</div>
+        <div class="glass-bright rounded-xl p-4">
+          <div class="text-xs text-gray-400 mb-2">GPU Utilization Over Time</div>
+          ${sparklineSVG(utils, 400, 60, '#22c55e')}
+        </div>
+        <div class="glass-bright rounded-xl p-4">
+          <div class="text-xs text-gray-400 mb-2">${hasConnections ? 'Concurrent Calls Over Time' : 'Active Requests Over Time'}</div>
+          ${sparklineSVG(hasConnections ? connections : running, 400, 60, '#06b6d4')}
+        </div>
+        <div class="glass-bright rounded-xl p-4">
+          <div class="text-xs text-gray-400 mb-2">Temperature Over Time</div>
+          ${sparklineSVG(temps, 400, 60, '#ef4444')}
+        </div>
+        <div class="glass-bright rounded-xl p-4">
+          <div class="text-xs text-gray-400 mb-2">Power Draw Over Time</div>
+          ${sparklineSVG(powers, 400, 60, '#f59e0b')}
+        </div>
       </div>
     </div>`;
   }
-  if(!html) html='<div class="text-gray-500 text-center py-12">Collecting history data...</div>';
-  el.innerHTML=html;
+  if (!html) html = '<div class="text-gray-500 text-center py-12">Loading history data...</div>';
+  el.innerHTML = html;
 }
 
+// ── Software & Tools Tab ──
+async function checkPyPI(pkgName) {
+  const normalized = pkgName.toLowerCase().replace(/_/g, '-');
+  if (pypiCache[normalized]) return pypiCache[normalized];
+  try {
+    const r = await fetch(`https://pypi.org/pypi/${normalized}/json`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const latest = d.info.version;
+    const summary = d.info.summary || '';
+    const projectUrl = d.info.project_url || d.info.package_url || '';
+    const releaseUrl = `https://pypi.org/project/${normalized}/${latest}/`;
+    pypiCache[normalized] = { latest, summary, releaseUrl };
+    return pypiCache[normalized];
+  } catch(e) { return null; }
+}
+
+function versionCompare(a, b) {
+  const pa = a.replace(/[^0-9.]/g,'').split('.').map(Number);
+  const pb = b.replace(/[^0-9.]/g,'').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i]||0, nb = pb[i]||0;
+    if (na < nb) return -1;
+    if (na > nb) return 1;
+  }
+  return 0;
+}
+
+async function loadSoftware() {
+  const el = document.getElementById('page-software');
+  el.innerHTML = '<div class="text-gray-500 text-center py-12"><div class="shimmer inline-block w-48 h-4 rounded mb-2"></div><div class="text-sm mt-2">Loading software inventory...</div></div>';
+  const [h200, rtx] = await Promise.all([
+    fetch(API_BASE+'/api/h200/software').then(r=>r.json()).catch(()=>null),
+    fetch(API_BASE+'/api/rtx5090/software').then(r=>r.json()).catch(()=>null),
+  ]);
+  softwareData.h200 = h200;
+  softwareData.rtx5090 = rtx;
+  softwareLoaded = true;
+  renderSoftware();
+}
+
+async function checkAllUpdates(serverKey) {
+  const sw = softwareData[serverKey];
+  if (!sw || !sw.environments) return;
+  for (const [envName, pkgs] of Object.entries(sw.environments)) {
+    for (const pkg of pkgs) {
+      const info = await checkPyPI(pkg.name);
+      if (info) {
+        pkg._latest = info.latest;
+        pkg._releaseUrl = info.releaseUrl;
+        pkg._hasUpdate = versionCompare(pkg.version, info.latest) < 0;
+      }
+    }
+  }
+  renderSoftware();
+}
+
+function renderSoftwareServer(key, sw) {
+  if (!sw || sw.error) {
+    return `<div class="glass rounded-2xl p-6 mb-6"><h3 class="text-lg font-semibold text-white">${key}</h3><p class="text-red-400 text-sm mt-2">${sw?.error||'Failed to load'}</p></div>`;
+  }
+
+  let sysHTML = `<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">NVIDIA Driver</div><div class="text-sm font-semibold text-white">${sw.driver}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">CUDA</div><div class="text-sm font-semibold text-white">${sw.cuda||'N/A'}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Kernel</div><div class="text-sm font-semibold text-white">${sw.kernel}</div></div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 uppercase mb-1">Python</div><div class="text-sm font-semibold text-white">${sw.python}</div></div>
+  </div>`;
+
+  // Services
+  let svcHTML = '';
+  if (sw.services && sw.services.length > 0) {
+    svcHTML = `<div class="mb-4"><div class="text-xs text-gray-400 mb-2 font-medium">Running Services</div><div class="flex flex-wrap gap-2">${sw.services.map(s=>`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>${s.name}</span>`).join('')}</div></div>`;
+  }
+
+  // Environments
+  let envHTML = '';
+  for (const [envName, pkgs] of Object.entries(sw.environments || {})) {
+    const hasAnyUpdate = pkgs.some(p => p._hasUpdate);
+    const checkedUpdates = pkgs.some(p => p._latest !== undefined);
+    envHTML += `<div class="glass-bright rounded-xl p-4 mb-3">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium text-white">${envName}</div>
+        <div class="flex items-center gap-2">
+          ${hasAnyUpdate ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">${pkgs.filter(p=>p._hasUpdate).length} updates available</span>` : ''}
+          <span class="text-[10px] text-gray-500">${pkgs.length} packages</span>
+        </div>
+      </div>
+      <table class="w-full text-xs">
+        <thead><tr class="text-gray-500 border-b border-gray-700/50">
+          <th class="text-left py-1.5 font-medium">Package</th>
+          <th class="text-left py-1.5 font-medium">Installed</th>
+          <th class="text-left py-1.5 font-medium">Latest</th>
+          <th class="text-right py-1.5 font-medium">Actions</th>
+        </tr></thead>
+        <tbody>${pkgs.map(p => {
+          const hasUpdate = p._hasUpdate;
+          const latest = p._latest || (checkedUpdates ? p.version : '-');
+          const rowClass = hasUpdate ? 'bg-amber-500/5' : '';
+          return `<tr class="${rowClass} border-b border-gray-800/30 hover:bg-white/[0.02]">
+            <td class="py-1.5 text-gray-300 font-medium">${p.name}</td>
+            <td class="py-1.5 ${hasUpdate?'text-amber-400':'text-gray-400'}">${p.version}</td>
+            <td class="py-1.5 ${hasUpdate?'text-emerald-400':'text-gray-500'}">${latest}</td>
+            <td class="py-1.5 text-right">
+              ${p._releaseUrl ? `<a href="${p._releaseUrl}" target="_blank" title="Release notes" class="inline-flex items-center justify-center w-6 h-6 rounded hover:bg-white/10 text-gray-500 hover:text-blue-400"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg></a>` : ''}
+              ${hasUpdate ? `<span title="Update available — run: pip install ${p.name}==${p._latest}" class="inline-flex items-center justify-center w-6 h-6 rounded hover:bg-white/10 text-amber-400 hover:text-amber-300 cursor-pointer"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg></span>` : ''}
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+  }
+
+  return `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-lg font-semibold text-white">${sw.server_name}</h3>
+      <button onclick="checkAllUpdates('${key}')" class="text-xs px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition-colors">Check for Updates</button>
+    </div>
+    ${sysHTML}${svcHTML}${envHTML}
+  </div>`;
+}
+
+function renderSoftware() {
+  const el = document.getElementById('page-software');
+  if (!softwareLoaded) {
+    el.innerHTML = '<div class="text-gray-500 text-center py-12">Click the Software & Tools tab to load inventory</div>';
+    return;
+  }
+  el.innerHTML = SERVERS.map(k => renderSoftwareServer(k, softwareData[k])).join('');
+}
+
+// ── Render All ──
 function renderAll() {
-  if(activeTab==='overview') renderOverview();
-  else if(activeTab==='traffic') renderTraffic();
-  else if(activeTab==='history') renderHistory();
+  if (activeTab === 'overview') renderOverview();
+  else if (activeTab === 'traffic') renderTraffic();
+  else if (activeTab === 'history') renderHistory();
+  else if (activeTab === 'software') renderSoftware();
 }
 
-// ── Fetch & Store ──
-const API_BASE = 'http://146.88.194.12:8080';
+// ── Data Fetching ──
 async function fetchServer(key) {
-  try { const r=await fetch(API_BASE+'/api/'+key); return await r.json(); }
-  catch(e) { return {server_name:key,status:'offline',error:e.message}; }
+  try { const r = await fetch(API_BASE+'/api/'+key); return await r.json(); }
+  catch(e) { return { server_name: key, status:'offline', error: e.message }; }
 }
 
-function recordHistory(key, d) {
-  if(!d||d.status==='offline') return;
-  const gpus=d.gpus||[], vllm=d.vllm||[];
-  const h=loadHistory(key);
-  h.push({
-    ts: d.timestamp,
-    u: gpus.length?Math.round(gpus.reduce((s,g)=>s+g.gpu_util,0)/gpus.length*10)/10:0,
-    t2: Math.max(...gpus.map(g=>g.temp||0),0),
-    pw: Math.round(gpus.reduce((s,g)=>s+g.power_draw,0)*10)/10,
-    rn: vllm.reduce((s,v)=>s+v.requests_running,0),
-    wt: vllm.reduce((s,v)=>s+v.requests_waiting,0),
-  });
-  saveHistory(key, h);
+async function fetchHistory(key) {
+  try { const r = await fetch(API_BASE+'/api/'+key+'/history'); const d = await r.json(); return d.history || []; }
+  catch(e) { return []; }
 }
 
 async function refresh() {
-  const results = await Promise.all(SERVERS.map(k=>fetchServer(k)));
-  SERVERS.forEach((k,i)=>{ serverData[k]=results[i]; recordHistory(k,results[i]); });
+  const [h200, rtx5090] = await Promise.all([fetchServer('h200'), fetchServer('rtx5090')]);
+  serverData.h200 = h200;
+  serverData.rtx5090 = rtx5090;
+
+  // Fetch history less frequently
+  if (!refresh._histCount) refresh._histCount = 0;
+  if (refresh._histCount % 5 === 0) {
+    const [hh, hr] = await Promise.all([fetchHistory('h200'), fetchHistory('rtx5090')]);
+    historyData.h200 = hh;
+    historyData.rtx5090 = hr;
+  }
+  refresh._histCount++;
+
   renderAll();
-  document.getElementById('lastUpdate').textContent='Updated: '+new Date().toLocaleTimeString();
+  document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }
 
 function updateRefreshRate() {
-  refreshRate=parseInt(document.getElementById('refreshRate').value);
-  if(refreshInterval) clearInterval(refreshInterval);
-  refreshInterval=setInterval(refresh,refreshRate);
+  refreshRate = parseInt(document.getElementById('refreshRate').value);
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = setInterval(refresh, refreshRate);
 }
 
 // Init
 renderOverview();
 refresh();
-refreshInterval=setInterval(refresh,refreshRate);
+refreshInterval = setInterval(refresh, refreshRate);
 </script>
 </body>
 </html>

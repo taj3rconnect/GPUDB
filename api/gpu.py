@@ -14,9 +14,11 @@ class handler(BaseHTTPRequestHandler):
         server_key = params.get("server", [None])[0]
         endpoint = params.get("endpoint", ["data"])[0]
 
-        # Special case: agent endpoint (no server_key needed)
+        # Special cases: endpoints that don't need a server_key
         if endpoint == "agent":
             upstream = f"{H200_API}/api/agent"
+        elif endpoint == "analytics":
+            upstream = f"{H200_API}/api/analytics"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

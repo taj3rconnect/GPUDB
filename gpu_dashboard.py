@@ -384,17 +384,43 @@ async def fetch_gpu_data(server_key: str) -> dict:
     # Sum of all GPU utilizations (not average — user wants total across all 8 GPUs)
     sum_gpu_util = sum(g["gpu_util"] for g in gpus)
 
+    # vLLM latency snapshot for this poll
+    _snap_ttft = 0
+    _snap_itl = 0
+    _snap_e2e = 0
+    _snap_queue = 0
+    _snap_kv = 0
+    if vllm_services:
+        _t = [v["avg_ttft_ms"] for v in vllm_services if v.get("avg_ttft_ms")]
+        _i = [v["avg_itl_ms"] for v in vllm_services if v.get("avg_itl_ms")]
+        _e = [v["avg_e2e_s"] for v in vllm_services if v.get("avg_e2e_s")]
+        _q = [v["avg_queue_s"] for v in vllm_services if v.get("avg_queue_s")]
+        _k = [v["kv_cache_usage"] for v in vllm_services if v.get("kv_cache_usage")]
+        _snap_ttft = round(sum(_t) / len(_t), 1) if _t else 0
+        _snap_itl = round(sum(_i) / len(_i), 1) if _i else 0
+        _snap_e2e = round(sum(_e) / len(_e), 3) if _e else 0
+        _snap_queue = round(sum(_q) / len(_q), 4) if _q else 0
+        _snap_kv = round(max(_k), 1) if _k else 0
+
     history[server_key].append({
         "t": now,
         "avg_util": round(avg_util, 1),
+        "sum_util": sum_gpu_util,
         "max_temp": max_temp,
         "total_power": total_power,
         "vram_pct": round(sum(g["mem_used"] for g in gpus) / max(sum(g["mem_total"] for g in gpus), 1) * 100, 1),
         "requests_running": total_running,
         "requests_waiting": total_waiting,
         "active_connections": active_connections,
+        "calls": calls,
         "net_rx": net_rx,
         "net_tx": net_tx,
+        "ttft_ms": _snap_ttft,
+        "itl_ms": _snap_itl,
+        "e2e_s": _snap_e2e,
+        "queue_s": _snap_queue,
+        "kv_cache": _snap_kv,
+        "gpu_count": len(gpus),
     })
 
     # ── Hourly aggregation ──
@@ -524,6 +550,333 @@ async def get_agent_status():
         return await asyncio.wait_for(fetch_agent_status(), timeout=15)
     except Exception as e:
         return {"error": str(e), "status": "offline"}
+
+
+# ── Cost & Analytics Config ───────────────────────────────────
+GPU_MONTHLY_COST = 25000  # $25,000/month total
+TOTAL_GPUS = 16  # 8 H200 + 8 RTX 5090
+COST_PER_GPU_HOUR = round(GPU_MONTHLY_COST / 30 / 24 / TOTAL_GPUS, 2)
+COST_PER_HOUR = round(GPU_MONTHLY_COST / 30 / 24, 2)
+
+# Quality thresholds for alerts
+ALERT_THRESHOLDS = {
+    "ttft_ms": {"warn": 300, "crit": 600, "label": "TTFT"},
+    "itl_ms": {"warn": 60, "crit": 120, "label": "Inter-Token Latency"},
+    "e2e_s": {"warn": 3.0, "crit": 6.0, "label": "E2E Latency"},
+    "kv_cache": {"warn": 75, "crit": 90, "label": "KV Cache Usage"},
+    "gpu_util_avg": {"warn": 80, "crit": 95, "label": "Avg GPU Utilization"},
+    "temp": {"warn": 75, "crit": 85, "label": "GPU Temperature"},
+    "vram_pct": {"warn": 85, "crit": 95, "label": "VRAM Usage"},
+    "queue_s": {"warn": 0.5, "crit": 2.0, "label": "Queue Time"},
+}
+
+
+@app.get("/api/analytics")
+async def get_analytics():
+    result = {
+        "cost": {},
+        "concurrency_quality": [],
+        "bottleneck": {},
+        "headroom": {},
+        "alerts": [],
+        "efficiency": {},
+        "quality_scorecard": {},
+    }
+
+    # ── 1. Cost Breakdown ──
+    # Compute cost based on actual utilization
+    all_history = []
+    for sk in SERVERS:
+        all_history.extend(list(history[sk]))
+
+    total_samples = len(all_history)
+    avg_concurrent_calls = 0
+    avg_gpu_util_all = 0
+    if total_samples > 0:
+        avg_concurrent_calls = sum(p.get("calls", 0) for p in all_history) / total_samples
+        avg_gpu_util_all = sum(p.get("avg_util", 0) for p in all_history) / total_samples
+
+    # Time window of data
+    if total_samples >= 2:
+        data_hours = (all_history[-1]["t"] - all_history[0]["t"]) / 3600
+    else:
+        data_hours = 0
+
+    cost_per_call_minute = 0
+    if avg_concurrent_calls > 0:
+        # Cost per minute = hourly cost / 60 / avg concurrent calls
+        cost_per_call_minute = round(COST_PER_HOUR / 60 / avg_concurrent_calls, 4)
+
+    result["cost"] = {
+        "monthly": GPU_MONTHLY_COST,
+        "daily": round(GPU_MONTHLY_COST / 30, 2),
+        "hourly": COST_PER_HOUR,
+        "per_gpu_hour": COST_PER_GPU_HOUR,
+        "per_call_minute": cost_per_call_minute,
+        "per_call_hour": round(cost_per_call_minute * 60, 2),
+        "avg_concurrent_calls": round(avg_concurrent_calls, 1),
+        "avg_gpu_util": round(avg_gpu_util_all, 1),
+        "total_gpus": TOTAL_GPUS,
+        "data_hours": round(data_hours, 1),
+        "idle_gpu_cost_hourly": round(COST_PER_HOUR * max(0, 1 - avg_gpu_util_all / 100), 2),
+        "utilized_gpu_cost_hourly": round(COST_PER_HOUR * min(1, avg_gpu_util_all / 100), 2),
+    }
+
+    # ── 2. Concurrency vs Quality Correlation ──
+    # Bucket history points by concurrent call count, compute avg latency per bucket
+    call_buckets = {}
+    for sk in SERVERS:
+        for p in history[sk]:
+            c = p.get("calls", 0)
+            ttft = p.get("ttft_ms", 0)
+            itl = p.get("itl_ms", 0)
+            e2e = p.get("e2e_s", 0)
+            queue = p.get("queue_s", 0)
+            kv = p.get("kv_cache", 0)
+            util = p.get("avg_util", 0)
+            if c not in call_buckets:
+                call_buckets[c] = {"ttft": [], "itl": [], "e2e": [], "queue": [], "kv": [], "util": [], "count": 0}
+            call_buckets[c]["count"] += 1
+            if ttft > 0:
+                call_buckets[c]["ttft"].append(ttft)
+            if itl > 0:
+                call_buckets[c]["itl"].append(itl)
+            if e2e > 0:
+                call_buckets[c]["e2e"].append(e2e)
+            if queue > 0:
+                call_buckets[c]["queue"].append(queue)
+            if kv > 0:
+                call_buckets[c]["kv"].append(kv)
+            call_buckets[c]["util"].append(util)
+
+    for c in sorted(call_buckets.keys()):
+        b = call_buckets[c]
+        result["concurrency_quality"].append({
+            "concurrent_calls": c,
+            "samples": b["count"],
+            "avg_ttft_ms": round(sum(b["ttft"]) / len(b["ttft"]), 1) if b["ttft"] else 0,
+            "avg_itl_ms": round(sum(b["itl"]) / len(b["itl"]), 1) if b["itl"] else 0,
+            "avg_e2e_s": round(sum(b["e2e"]) / len(b["e2e"]), 3) if b["e2e"] else 0,
+            "avg_queue_s": round(sum(b["queue"]) / len(b["queue"]), 4) if b["queue"] else 0,
+            "avg_kv_cache": round(sum(b["kv"]) / len(b["kv"]), 1) if b["kv"] else 0,
+            "avg_gpu_util": round(sum(b["util"]) / len(b["util"]), 1) if b["util"] else 0,
+        })
+
+    # ── 3. Bottleneck Analysis ──
+    # From H200 vLLM metrics: what fraction of pipeline is LLM, TTS, queue
+    h200_hist = list(history.get("h200", []))
+    llm_time = []
+    tts_time = []
+    queue_time = []
+    for p in h200_hist:
+        if p.get("e2e_s", 0) > 0:
+            ttft = p.get("ttft_ms", 0) / 1000  # convert to seconds
+            itl_total = p.get("e2e_s", 0) - ttft  # generation time
+            q = p.get("queue_s", 0)
+            total = p.get("e2e_s", 0) + q
+            if total > 0:
+                llm_time.append(ttft / total)
+                tts_time.append(itl_total / total)
+                queue_time.append(q / total)
+
+    if llm_time:
+        avg_llm = sum(llm_time) / len(llm_time)
+        avg_tts = sum(tts_time) / len(tts_time)
+        avg_queue = sum(queue_time) / len(queue_time)
+        avg_other = max(0, 1 - avg_llm - avg_tts - avg_queue)
+        result["bottleneck"] = {
+            "llm_pct": round(avg_llm * 100, 1),
+            "tts_generation_pct": round(avg_tts * 100, 1),
+            "queue_pct": round(avg_queue * 100, 1),
+            "other_pct": round(avg_other * 100, 1),
+            "primary_bottleneck": "LLM (TTFT)" if avg_llm >= avg_tts else "TTS/Generation",
+            "samples": len(llm_time),
+        }
+    else:
+        result["bottleneck"] = {"llm_pct": 0, "tts_generation_pct": 0, "queue_pct": 0, "other_pct": 100, "primary_bottleneck": "Insufficient data", "samples": 0}
+
+    # ── 4. GPU Headroom & Capacity Planning ──
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            result["headroom"][sk] = {"status": "no data"}
+            continue
+        recent = sk_hist[-min(60, len(sk_hist)):]  # last ~60 samples
+        avg_util = sum(p.get("avg_util", 0) for p in recent) / len(recent)
+        avg_vram = sum(p.get("vram_pct", 0) for p in recent) / len(recent)
+        avg_kv = sum(p.get("kv_cache", 0) for p in recent) / len(recent)
+        avg_power = sum(p.get("total_power", 0) for p in recent) / len(recent)
+        peak_util = max(p.get("avg_util", 0) for p in recent)
+        peak_calls = max(p.get("calls", 0) for p in recent)
+        avg_calls = sum(p.get("calls", 0) for p in recent) / len(recent)
+        gpu_count = recent[-1].get("gpu_count", 8)
+
+        # Estimate max concurrent calls before GPU saturation
+        if avg_calls > 0 and avg_util > 0:
+            util_per_call = avg_util / avg_calls
+            max_calls_est = int(90 / util_per_call) if util_per_call > 0 else 999
+        else:
+            util_per_call = 0
+            max_calls_est = 0
+
+        # KV cache capacity estimate
+        if avg_calls > 0 and avg_kv > 0:
+            kv_per_call = avg_kv / avg_calls
+            max_calls_kv = int(85 / kv_per_call) if kv_per_call > 0 else 999
+        else:
+            kv_per_call = 0
+            max_calls_kv = 0
+
+        result["headroom"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "gpu_count": gpu_count,
+            "avg_util": round(avg_util, 1),
+            "peak_util": round(peak_util, 1),
+            "util_headroom": round(100 - avg_util, 1),
+            "avg_vram_pct": round(avg_vram, 1),
+            "vram_headroom": round(100 - avg_vram, 1),
+            "avg_kv_cache": round(avg_kv, 1),
+            "kv_headroom": round(100 - avg_kv, 1) if avg_kv > 0 else 100,
+            "avg_power_w": round(avg_power, 0),
+            "avg_calls": round(avg_calls, 1),
+            "peak_calls": peak_calls,
+            "util_per_call": round(util_per_call, 2),
+            "est_max_calls_gpu": max_calls_est,
+            "est_max_calls_kv": max_calls_kv,
+            "est_max_calls": min(max_calls_est, max_calls_kv) if max_calls_kv > 0 else max_calls_est,
+            "scale_factor": round(min(max_calls_est, max_calls_kv) / max(avg_calls, 1), 1) if max_calls_est > 0 else 0,
+        }
+
+    # ── 5. Call Quality Scorecard ──
+    # Aggregate quality metrics from recent history
+    all_ttft = []
+    all_itl = []
+    all_e2e = []
+    all_queue = []
+    all_kv = []
+    for sk in SERVERS:
+        for p in list(history[sk])[-300:]:  # last 300 samples
+            if p.get("ttft_ms", 0) > 0:
+                all_ttft.append(p["ttft_ms"])
+            if p.get("itl_ms", 0) > 0:
+                all_itl.append(p["itl_ms"])
+            if p.get("e2e_s", 0) > 0:
+                all_e2e.append(p["e2e_s"])
+            if p.get("queue_s", 0) > 0:
+                all_queue.append(p["queue_s"])
+            if p.get("kv_cache", 0) > 0:
+                all_kv.append(p["kv_cache"])
+
+    def percentile(arr, p):
+        if not arr:
+            return 0
+        s = sorted(arr)
+        k = (len(s) - 1) * p / 100
+        f = int(k)
+        c = f + 1
+        if c >= len(s):
+            return s[f]
+        return s[f] + (k - f) * (s[c] - s[f])
+
+    result["quality_scorecard"] = {
+        "ttft": {
+            "avg": round(sum(all_ttft) / len(all_ttft), 1) if all_ttft else 0,
+            "p50": round(percentile(all_ttft, 50), 1),
+            "p95": round(percentile(all_ttft, 95), 1),
+            "p99": round(percentile(all_ttft, 99), 1),
+            "samples": len(all_ttft),
+        },
+        "itl": {
+            "avg": round(sum(all_itl) / len(all_itl), 1) if all_itl else 0,
+            "p50": round(percentile(all_itl, 50), 1),
+            "p95": round(percentile(all_itl, 95), 1),
+            "p99": round(percentile(all_itl, 99), 1),
+            "samples": len(all_itl),
+        },
+        "e2e": {
+            "avg": round(sum(all_e2e) / len(all_e2e), 3) if all_e2e else 0,
+            "p50": round(percentile(all_e2e, 50), 3),
+            "p95": round(percentile(all_e2e, 95), 3),
+            "p99": round(percentile(all_e2e, 99), 3),
+            "samples": len(all_e2e),
+        },
+        "queue": {
+            "avg": round(sum(all_queue) / len(all_queue), 4) if all_queue else 0,
+            "p50": round(percentile(all_queue, 50), 4),
+            "p95": round(percentile(all_queue, 95), 4),
+            "p99": round(percentile(all_queue, 99), 4),
+            "samples": len(all_queue),
+        },
+        "kv_cache": {
+            "avg": round(sum(all_kv) / len(all_kv), 1) if all_kv else 0,
+            "peak": round(max(all_kv), 1) if all_kv else 0,
+            "samples": len(all_kv),
+        },
+    }
+
+    # ── 6. Alerts ──
+    alerts = []
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            continue
+        latest = sk_hist[-1]
+        checks = {
+            "ttft_ms": latest.get("ttft_ms", 0),
+            "itl_ms": latest.get("itl_ms", 0),
+            "e2e_s": latest.get("e2e_s", 0),
+            "kv_cache": latest.get("kv_cache", 0),
+            "gpu_util_avg": latest.get("avg_util", 0),
+            "temp": latest.get("max_temp", 0),
+            "vram_pct": latest.get("vram_pct", 0),
+            "queue_s": latest.get("queue_s", 0),
+        }
+        for metric, value in checks.items():
+            if value <= 0:
+                continue
+            th = ALERT_THRESHOLDS.get(metric)
+            if not th:
+                continue
+            if value >= th["crit"]:
+                alerts.append({"server": sk, "metric": th["label"], "value": round(value, 2), "threshold": th["crit"], "level": "critical"})
+            elif value >= th["warn"]:
+                alerts.append({"server": sk, "metric": th["label"], "value": round(value, 2), "threshold": th["warn"], "level": "warning"})
+    result["alerts"] = alerts
+
+    # ── 7. Model Efficiency ──
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if len(sk_hist) < 2:
+            continue
+        recent = sk_hist[-min(60, len(sk_hist)):]
+        avg_power = sum(p.get("total_power", 0) for p in recent) / len(recent)
+
+        # Get current vLLM throughput from hourly stats
+        hs = hourly_stats.get(sk, {})
+        if hs:
+            latest_hour = max(hs.values(), key=lambda x: x["hour_ts"])
+            duration_s = max(latest_hour["samples"] * 3, 1)  # ~3s per sample
+            reqs_delta = latest_hour["_vllm_reqs_end"] - latest_hour["_vllm_reqs_start"]
+            prompt_delta = latest_hour["_vllm_prompt_end"] - latest_hour["_vllm_prompt_start"]
+            gen_delta = latest_hour["_vllm_gen_end"] - latest_hour["_vllm_gen_start"]
+            total_tokens = prompt_delta + gen_delta
+            tokens_per_sec = total_tokens / duration_s if duration_s > 0 else 0
+            reqs_per_min = reqs_delta / (duration_s / 60) if duration_s > 0 else 0
+            tokens_per_watt = tokens_per_sec / avg_power if avg_power > 0 else 0
+
+            result["efficiency"][sk] = {
+                "server_name": SERVERS[sk]["name"],
+                "tokens_per_sec": round(tokens_per_sec, 1),
+                "reqs_per_min": round(reqs_per_min, 1),
+                "tokens_per_watt": round(tokens_per_watt, 3),
+                "avg_power_w": round(avg_power, 0),
+                "prompt_tokens_hour": prompt_delta,
+                "gen_tokens_hour": gen_delta,
+                "total_tokens_hour": total_tokens,
+                "cost_per_million_tokens": round((COST_PER_HOUR / max(total_tokens / 1e6, 0.001)), 2) if total_tokens > 0 else 0,
+            }
+
+    return result
 
 
 @app.get("/api/{server_key}")
@@ -957,6 +1310,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('software')" id="tab-software">Software & Tools</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('daily')" id="tab-daily">24h Report</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
 </div>
 
 <!-- Content -->
@@ -967,6 +1321,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-software" class="hidden"></div>
   <div id="page-daily" class="hidden"></div>
   <div id="page-agent" class="hidden"></div>
+  <div id="page-analytics" class="hidden"></div>
 </div>
 
 <script>
@@ -983,6 +1338,8 @@ let pypiCache = {};
 let dailyData = {};
 let dailyLoaded = false;
 let agentData = null;
+let analyticsData = null;
+let analyticsLoaded = false;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -1019,7 +1376,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -1027,6 +1384,7 @@ function switchTab(tab) {
   if (tab === 'software' && !softwareLoaded) loadSoftware();
   if (tab === 'daily' && !dailyLoaded) loadDaily();
   if (tab === 'agent') loadAgent();
+  if (tab === 'analytics') loadAnalytics();
 }
 
 // ── Overview Tab ──
@@ -1802,6 +2160,417 @@ function renderAgent() {
   </div>`;
 }
 
+// ── Analytics & Cost Tab ──
+async function loadAnalytics() {
+  const el = document.getElementById('page-analytics');
+  if (!analyticsData) el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading analytics...</div>';
+  try {
+    const r = await fetch('/api/analytics');
+    analyticsData = await r.json();
+  } catch(e) {
+    analyticsData = { error: e.message };
+  }
+  analyticsLoaded = true;
+  renderAnalytics();
+}
+
+function renderAnalytics() {
+  const el = document.getElementById('page-analytics');
+  const d = analyticsData;
+  if (!d || d.error) {
+    el.innerHTML = `<div class="glass rounded-2xl p-6"><h3 class="text-lg font-semibold text-white">Analytics</h3><p class="text-red-400 text-sm mt-2">${d?.error||'Failed to load'}</p></div>`;
+    return;
+  }
+
+  const c = d.cost || {};
+  const cq = d.concurrency_quality || [];
+  const bn = d.bottleneck || {};
+  const hd = d.headroom || {};
+  const al = d.alerts || [];
+  const qs = d.quality_scorecard || {};
+  const ef = d.efficiency || {};
+
+  // ── Section 1: Cost Breakdown ──
+  let costHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center">
+          <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold text-white">Cost Breakdown</h3>
+          <p class="text-[11px] text-gray-500">${c.total_gpus} GPUs &middot; Based on ${c.data_hours}h of data</p>
+        </div>
+      </div>
+      <button onclick="loadAnalytics()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Monthly Cost</div>
+        <div class="text-xl font-bold text-white">$${fmt(c.monthly)}</div>
+        <div class="text-[9px] text-gray-500">total GPU infra</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Daily Cost</div>
+        <div class="text-xl font-bold text-white">$${c.daily?.toFixed(0)}</div>
+        <div class="text-[9px] text-gray-500">per day</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Per GPU/Hour</div>
+        <div class="text-xl font-bold text-cyan-400">$${c.per_gpu_hour}</div>
+        <div class="text-[9px] text-gray-500">${c.total_gpus} GPUs</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Cost/Call/Min</div>
+        <div class="text-xl font-bold ${c.per_call_minute>0?'text-emerald-400':'text-gray-500'}">$${c.per_call_minute?.toFixed(4)||'—'}</div>
+        <div class="text-[9px] text-gray-500">avg ${c.avg_concurrent_calls} concurrent</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Cost/Call/Hour</div>
+        <div class="text-xl font-bold ${c.per_call_hour>0?'text-emerald-400':'text-gray-500'}">$${c.per_call_hour?.toFixed(2)||'—'}</div>
+        <div class="text-[9px] text-gray-500">per active call</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Idle GPU Waste</div>
+        <div class="text-xl font-bold text-red-400">$${c.idle_gpu_cost_hourly?.toFixed(2)}/hr</div>
+        <div class="text-[9px] text-gray-500">${(100 - (c.avg_gpu_util||0)).toFixed(0)}% idle</div>
+      </div>
+    </div>
+    <div class="glass-bright rounded-lg p-3">
+      <div class="text-xs text-gray-400 mb-2">Cost Utilization</div>
+      <div class="flex items-center gap-3">
+        <div class="flex-1">
+          <div class="bar-track rounded-full h-3 w-full flex overflow-hidden">
+            <div class="h-3 rounded-l-full" style="width:${c.avg_gpu_util||0}%;background:#22c55e"></div>
+            <div class="h-3 ${c.avg_gpu_util>=100?'':'rounded-r-full'}" style="width:${100-(c.avg_gpu_util||0)}%;background:rgba(239,68,68,0.3)"></div>
+          </div>
+        </div>
+        <div class="flex gap-4 text-[10px]">
+          <span class="text-emerald-400">Utilized: $${c.utilized_gpu_cost_hourly?.toFixed(2)}/hr</span>
+          <span class="text-red-400">Idle: $${c.idle_gpu_cost_hourly?.toFixed(2)}/hr</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  // ── Section 2: Concurrency vs Quality ──
+  let cqHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Concurrency vs Quality</h3>
+        <p class="text-[11px] text-gray-500">How latency changes as concurrent calls increase</p>
+      </div>
+    </div>`;
+
+  if (cq.length === 0) {
+    cqHTML += '<p class="text-gray-500 text-sm">Collecting data... Quality metrics will appear as calls are processed.</p>';
+  } else {
+    // Find the "sweet spot" — highest concurrency where TTFT stays under 300ms
+    const sweetSpot = [...cq].reverse().find(r => r.avg_ttft_ms > 0 && r.avg_ttft_ms <= 300);
+    const degradePoint = cq.find(r => r.avg_ttft_ms > 500 && r.concurrent_calls > 0);
+
+    if (sweetSpot || degradePoint) {
+      cqHTML += `<div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+        ${sweetSpot ? `<div class="glass-bright rounded-lg p-3 border-l-2 border-emerald-500">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Sweet Spot</div>
+          <div class="text-lg font-bold text-emerald-400">${sweetSpot.concurrent_calls} concurrent calls</div>
+          <div class="text-[11px] text-gray-400">TTFT stays under 300ms (avg ${sweetSpot.avg_ttft_ms}ms)</div>
+        </div>` : ''}
+        ${degradePoint ? `<div class="glass-bright rounded-lg p-3 border-l-2 border-red-500">
+          <div class="text-[10px] text-gray-500 uppercase mb-1">Degradation Point</div>
+          <div class="text-lg font-bold text-red-400">${degradePoint.concurrent_calls} concurrent calls</div>
+          <div class="text-[11px] text-gray-400">TTFT exceeds 500ms (avg ${degradePoint.avg_ttft_ms}ms)</div>
+        </div>` : ''}
+      </div>`;
+    }
+
+    const maxTTFT = Math.max(...cq.map(r=>r.avg_ttft_ms), 1);
+    cqHTML += `<div class="glass-bright rounded-xl p-4 overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead><tr class="text-gray-500 border-b border-gray-700/50">
+          <th class="text-left py-1.5 px-2 font-medium">Concurrent Calls</th>
+          <th class="text-left py-1.5 px-2 font-medium">TTFT (ms)</th>
+          <th class="text-left py-1.5 px-2 font-medium">ITL (ms)</th>
+          <th class="text-left py-1.5 px-2 font-medium">E2E (s)</th>
+          <th class="text-left py-1.5 px-2 font-medium">Queue (s)</th>
+          <th class="text-left py-1.5 px-2 font-medium">KV Cache %</th>
+          <th class="text-left py-1.5 px-2 font-medium">GPU Util %</th>
+          <th class="text-right py-1.5 px-2 font-medium">Samples</th>
+        </tr></thead>
+        <tbody>${cq.map(r => {
+          const ttftColor = r.avg_ttft_ms > 500 ? 'text-red-400' : r.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400';
+          const ttftBar = maxTTFT > 0 ? (r.avg_ttft_ms / maxTTFT * 100) : 0;
+          return `<tr class="border-b border-gray-800/30 hover:bg-white/[0.03]">
+            <td class="py-1.5 px-2 text-white font-semibold">${r.concurrent_calls}</td>
+            <td class="py-1.5 px-2">
+              <div class="flex items-center gap-2">
+                <span class="${ttftColor} font-semibold">${r.avg_ttft_ms > 0 ? r.avg_ttft_ms.toFixed(0) : '—'}</span>
+                <div class="bar-track rounded-full h-1 w-16"><div class="bar-fill rounded-full h-1" style="width:${ttftBar}%;background:${r.avg_ttft_ms>500?'#ef4444':r.avg_ttft_ms>300?'#f59e0b':'#22c55e'}"></div></div>
+              </div>
+            </td>
+            <td class="py-1.5 px-2 text-gray-400">${r.avg_itl_ms > 0 ? r.avg_itl_ms.toFixed(1) : '—'}</td>
+            <td class="py-1.5 px-2 text-gray-400">${r.avg_e2e_s > 0 ? r.avg_e2e_s.toFixed(2) : '—'}</td>
+            <td class="py-1.5 px-2 text-gray-400">${r.avg_queue_s > 0 ? r.avg_queue_s.toFixed(3) : '—'}</td>
+            <td class="py-1.5 px-2 text-gray-400">${r.avg_kv_cache > 0 ? r.avg_kv_cache.toFixed(1) : '—'}</td>
+            <td class="py-1.5 px-2 text-gray-400">${r.avg_gpu_util.toFixed(1)}</td>
+            <td class="py-1.5 px-2 text-right text-gray-500">${r.samples}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+  }
+  cqHTML += '</div>';
+
+  // ── Section 3: Bottleneck Analysis ──
+  let bnHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Bottleneck Analysis</h3>
+        <p class="text-[11px] text-gray-500">Where time is spent in the inference pipeline (${bn.samples||0} samples)</p>
+      </div>
+    </div>`;
+
+  if (bn.samples > 0) {
+    const segs = [
+      { label: 'LLM (TTFT)', pct: bn.llm_pct, color: '#06b6d4' },
+      { label: 'TTS/Generation', pct: bn.tts_generation_pct, color: '#8b5cf6' },
+      { label: 'Queue Wait', pct: bn.queue_pct, color: '#f59e0b' },
+      { label: 'Other/Network', pct: bn.other_pct, color: '#6b7280' },
+    ];
+    bnHTML += `<div class="glass-bright rounded-lg p-4 mb-3">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="text-xs text-gray-400">Primary bottleneck:</span>
+        <span class="text-sm font-semibold text-white">${bn.primary_bottleneck}</span>
+      </div>
+      <div class="bar-track rounded-full h-6 w-full flex overflow-hidden mb-3">
+        ${segs.map(s => `<div class="h-6 flex items-center justify-center" style="width:${s.pct}%;background:${s.color}" title="${s.label}: ${s.pct}%">
+          ${s.pct >= 10 ? `<span class="text-[9px] text-white font-medium">${s.pct}%</span>` : ''}
+        </div>`).join('')}
+      </div>
+      <div class="flex flex-wrap gap-4">
+        ${segs.map(s => `<div class="flex items-center gap-1.5">
+          <div class="w-2.5 h-2.5 rounded-sm" style="background:${s.color}"></div>
+          <span class="text-[11px] text-gray-400">${s.label}: <span class="text-white font-medium">${s.pct}%</span></span>
+        </div>`).join('')}
+      </div>
+    </div>`;
+  } else {
+    bnHTML += '<p class="text-gray-500 text-sm">Collecting latency data...</p>';
+  }
+  bnHTML += '</div>';
+
+  // ── Section 4: GPU Headroom & Capacity ──
+  let hdHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">GPU Headroom & Capacity Planning</h3>
+        <p class="text-[11px] text-gray-500">How much more load can each cluster handle</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+
+  for (const [sk, h] of Object.entries(hd)) {
+    if (h.status === 'no data') {
+      hdHTML += `<div class="glass-bright rounded-xl p-4"><span class="text-gray-500 text-sm">${sk}: No data yet</span></div>`;
+      continue;
+    }
+    const utilColor = h.avg_util >= 80 ? 'text-red-400' : h.avg_util >= 50 ? 'text-amber-400' : 'text-emerald-400';
+    hdHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-sm font-semibold text-white">${h.server_name}</span>
+        <span class="text-xs px-2 py-0.5 rounded-full ${h.scale_factor>=2?'bg-emerald-500/20 text-emerald-400':h.scale_factor>=1.3?'bg-amber-500/20 text-amber-400':'bg-red-500/20 text-red-400'}">${h.scale_factor}x headroom</span>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Avg GPU</div>
+          <div class="text-base font-bold ${utilColor}">${h.avg_util}%</div>
+          <div class="text-[9px] text-gray-500">${h.util_headroom}% free</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">VRAM</div>
+          <div class="text-base font-bold text-white">${h.avg_vram_pct}%</div>
+          <div class="text-[9px] text-gray-500">${h.vram_headroom}% free</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">KV Cache</div>
+          <div class="text-base font-bold text-white">${h.avg_kv_cache}%</div>
+          <div class="text-[9px] text-gray-500">${h.kv_headroom.toFixed(0)}% free</div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-2 mb-3">
+        <div class="bg-white/[0.02] rounded-lg p-2">
+          <div class="text-[9px] text-gray-500 uppercase mb-0.5">Current Calls</div>
+          <div class="flex items-baseline gap-1">
+            <span class="text-base font-bold text-cyan-400">${h.avg_calls}</span>
+            <span class="text-[10px] text-gray-500">avg / ${h.peak_calls} peak</span>
+          </div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2">
+          <div class="text-[9px] text-gray-500 uppercase mb-0.5">Est. Max Calls</div>
+          <div class="flex items-baseline gap-1">
+            <span class="text-base font-bold text-emerald-400">${h.est_max_calls}</span>
+            <span class="text-[10px] text-gray-500">${h.util_per_call}% GPU/call</span>
+          </div>
+        </div>
+      </div>
+      <div class="text-[10px] text-gray-500">
+        Limits: GPU → ${h.est_max_calls_gpu} calls &middot; KV Cache → ${h.est_max_calls_kv > 0 ? h.est_max_calls_kv : '∞'} calls
+      </div>
+    </div>`;
+  }
+  hdHTML += '</div></div>';
+
+  // ── Section 5: Quality Scorecard ──
+  let qsHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-pink-500 to-rose-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Call Quality Scorecard</h3>
+        <p class="text-[11px] text-gray-500">Latency percentiles from recent data</p>
+      </div>
+    </div>`;
+
+  const metrics = [
+    { key: 'ttft', label: 'Time to First Token', unit: 'ms', warn: 300, crit: 600 },
+    { key: 'itl', label: 'Inter-Token Latency', unit: 'ms', warn: 60, crit: 120 },
+    { key: 'e2e', label: 'End-to-End Latency', unit: 's', warn: 3.0, crit: 6.0 },
+    { key: 'queue', label: 'Queue Wait Time', unit: 's', warn: 0.5, crit: 2.0 },
+  ];
+
+  qsHTML += '<div class="grid grid-cols-1 md:grid-cols-2 gap-3">';
+  for (const m of metrics) {
+    const v = qs[m.key] || {};
+    if (!v.samples) continue;
+    const p95Color = v.p95 >= m.crit ? 'text-red-400' : v.p95 >= m.warn ? 'text-amber-400' : 'text-emerald-400';
+    const avgColor = v.avg >= m.crit ? 'text-red-400' : v.avg >= m.warn ? 'text-amber-400' : 'text-emerald-400';
+    qsHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-medium text-white">${m.label}</span>
+        <span class="text-[10px] text-gray-500">${v.samples} samples</span>
+      </div>
+      <div class="grid grid-cols-4 gap-2">
+        <div class="text-center"><div class="text-[9px] text-gray-500">Avg</div><div class="text-sm font-bold ${avgColor}">${v.avg}${m.unit}</div></div>
+        <div class="text-center"><div class="text-[9px] text-gray-500">P50</div><div class="text-sm font-bold text-gray-300">${v.p50}${m.unit}</div></div>
+        <div class="text-center"><div class="text-[9px] text-gray-500">P95</div><div class="text-sm font-bold ${p95Color}">${v.p95}${m.unit}</div></div>
+        <div class="text-center"><div class="text-[9px] text-gray-500">P99</div><div class="text-sm font-bold text-gray-400">${v.p99}${m.unit}</div></div>
+      </div>
+      <div class="mt-2">${barHTML(v.avg, m.crit, v.avg >= m.crit ? '#ef4444' : v.avg >= m.warn ? '#f59e0b' : '#22c55e')}</div>
+    </div>`;
+  }
+  // KV Cache
+  if (qs.kv_cache?.samples) {
+    const kv = qs.kv_cache;
+    qsHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-medium text-white">KV Cache Usage</span>
+        <span class="text-[10px] text-gray-500">${kv.samples} samples</span>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <div class="text-center"><div class="text-[9px] text-gray-500">Avg</div><div class="text-sm font-bold text-white">${kv.avg}%</div></div>
+        <div class="text-center"><div class="text-[9px] text-gray-500">Peak</div><div class="text-sm font-bold ${kv.peak>=90?'text-red-400':kv.peak>=75?'text-amber-400':'text-emerald-400'}">${kv.peak}%</div></div>
+      </div>
+      <div class="mt-2">${barHTML(kv.avg, 100, kv.avg >= 90 ? '#ef4444' : kv.avg >= 75 ? '#f59e0b' : '#22c55e')}</div>
+    </div>`;
+  }
+  qsHTML += '</div></div>';
+
+  // ── Section 6: Alerts ──
+  let alHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 to-rose-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Alerts & Thresholds</h3>
+        <p class="text-[11px] text-gray-500">Current threshold violations</p>
+      </div>
+    </div>`;
+
+  if (al.length === 0) {
+    alHTML += '<div class="glass-bright rounded-lg p-4 text-center"><span class="text-emerald-400 text-sm font-medium">All metrics within normal thresholds</span></div>';
+  } else {
+    alHTML += '<div class="space-y-2">';
+    for (const a of al) {
+      const isCrit = a.level === 'critical';
+      alHTML += `<div class="glass-bright rounded-lg p-3 flex items-center justify-between ${isCrit?'border-l-2 border-red-500':'border-l-2 border-amber-500'}">
+        <div class="flex items-center gap-3">
+          <span class="w-2 h-2 rounded-full ${isCrit?'bg-red-500':'bg-amber-500'}"></span>
+          <div>
+            <span class="text-xs font-medium text-white">${a.metric}</span>
+            <span class="text-[10px] text-gray-500 ml-2">${a.server}</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="text-sm font-bold ${isCrit?'text-red-400':'text-amber-400'}">${a.value}</span>
+          <span class="text-[10px] text-gray-500">threshold: ${a.threshold}</span>
+          <span class="text-[10px] px-2 py-0.5 rounded-full ${isCrit?'bg-red-500/20 text-red-400':'bg-amber-500/20 text-amber-400'}">${a.level}</span>
+        </div>
+      </div>`;
+    }
+    alHTML += '</div>';
+  }
+  alHTML += '</div>';
+
+  // ── Section 7: Model Efficiency ──
+  let efHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Model Efficiency</h3>
+        <p class="text-[11px] text-gray-500">Throughput and cost-per-token metrics</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+
+  for (const [sk, e] of Object.entries(ef)) {
+    efHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="text-sm font-semibold text-white mb-3">${e.server_name}</div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Tokens/sec</div>
+          <div class="text-base font-bold text-cyan-400">${e.tokens_per_sec}</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Reqs/min</div>
+          <div class="text-base font-bold text-white">${e.reqs_per_min}</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Tokens/Watt</div>
+          <div class="text-base font-bold text-emerald-400">${e.tokens_per_watt}</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">$/1M Tokens</div>
+          <div class="text-base font-bold text-amber-400">$${e.cost_per_million_tokens}</div>
+        </div>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-2">
+        <div class="text-center text-[10px]"><span class="text-gray-500">Prompt:</span> <span class="text-gray-300">${(e.prompt_tokens_hour/1e3).toFixed(1)}K tok/hr</span></div>
+        <div class="text-center text-[10px]"><span class="text-gray-500">Gen:</span> <span class="text-gray-300">${(e.gen_tokens_hour/1e3).toFixed(1)}K tok/hr</span></div>
+        <div class="text-center text-[10px]"><span class="text-gray-500">Power:</span> <span class="text-gray-300">${e.avg_power_w}W avg</span></div>
+      </div>
+    </div>`;
+  }
+  if (Object.keys(ef).length === 0) {
+    efHTML += '<div class="glass-bright rounded-xl p-4 text-gray-500 text-sm col-span-2">Collecting throughput data...</div>';
+  }
+  efHTML += '</div></div>';
+
+  el.innerHTML = costHTML + cqHTML + bnHTML + hdHTML + qsHTML + alHTML + efHTML;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -1810,6 +2579,7 @@ function renderAll() {
   else if (activeTab === 'software') renderSoftware();
   else if (activeTab === 'daily') renderDaily();
   else if (activeTab === 'agent') renderAgent();
+  else if (activeTab === 'analytics') renderAnalytics();
 }
 
 // ── Data Fetching ──

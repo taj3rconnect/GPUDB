@@ -5,10 +5,12 @@ from collections import deque
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncssh
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Server Config ──────────────────────────────────────────────
 SERVERS = {
@@ -20,6 +22,7 @@ SERVERS = {
         "gpu_model": "NVIDIA H200",
         "has_ecc": True,
         "vllm_ports": [8001, 8002],
+        "local": True,
     },
     "rtx5090": {
         "name": "RTX 5090 Cluster",
@@ -40,7 +43,17 @@ MAX_HISTORY = 1440  # 24hrs at 1-min intervals, or ~72min at 3s
 history = {k: deque(maxlen=MAX_HISTORY) for k in SERVERS}
 
 
-# ── SSH Helpers ────────────────────────────────────────────────
+# ── Command Helpers ────────────────────────────────────────────
+async def run_local_command(command: str) -> str:
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    return stdout.decode("utf-8", errors="replace")
+
+
 async def run_ssh_command(server: dict, command: str) -> str:
     conn = await asyncssh.connect(
         server["host"],
@@ -52,6 +65,12 @@ async def run_ssh_command(server: dict, command: str) -> str:
     async with conn:
         result = await conn.run(command, check=False)
         return result.stdout or ""
+
+
+async def run_command(server: dict, command: str) -> str:
+    if server.get("local"):
+        return await run_local_command(command)
+    return await run_ssh_command(server, command)
 
 
 # ── Prometheus Parser ──────────────────────────────────────────
@@ -206,13 +225,13 @@ async def fetch_gpu_data(server_key: str) -> dict:
         vllm_combined = " && ".join(parts)
 
     tasks = [
-        run_ssh_command(server, gpu_query),
-        run_ssh_command(server, proc_query),
-        run_ssh_command(server, sys_query),
-        run_ssh_command(server, net_query),
+        run_command(server, gpu_query),
+        run_command(server, proc_query),
+        run_command(server, sys_query),
+        run_command(server, net_query),
     ]
     if vllm_combined:
-        tasks.append(run_ssh_command(server, vllm_combined))
+        tasks.append(run_command(server, vllm_combined))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     gpu_out = results[0] if not isinstance(results[0], Exception) else ""

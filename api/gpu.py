@@ -27,6 +27,8 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/{server_key}/history"
         elif endpoint == "software":
             upstream = f"{H200_API}/api/{server_key}/software"
+        elif endpoint == "daily":
+            upstream = f"{H200_API}/api/{server_key}/daily"
         else:
             upstream = f"{H200_API}/api/{server_key}"
 

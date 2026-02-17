@@ -1,0 +1,46 @@
+import json
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from urllib.request import urlopen, Request
+
+
+H200_API = "http://146.88.194.12:8080"
+
+
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        server_key = params.get("server", [None])[0]
+        endpoint = params.get("endpoint", ["data"])[0]
+
+        if server_key not in ("h200", "rtx5090"):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Use ?server=h200 or ?server=rtx5090"}).encode())
+            return
+
+        # Build upstream URL
+        if endpoint == "history":
+            upstream = f"{H200_API}/api/{server_key}/history"
+        elif endpoint == "software":
+            upstream = f"{H200_API}/api/{server_key}/software"
+        else:
+            upstream = f"{H200_API}/api/{server_key}"
+
+        try:
+            req = Request(upstream, headers={"User-Agent": "vercel-proxy"})
+            resp = urlopen(req, timeout=20)
+            data = resp.read()
+            self.send_response(200)
+        except Exception as e:
+            data = json.dumps({"error": str(e), "status": "offline"}).encode()
+            self.send_response(502)
+
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)

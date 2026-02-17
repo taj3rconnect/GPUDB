@@ -89,7 +89,7 @@ let activeTab = 'overview';
 let softwareData = {};
 let softwareLoaded = false;
 let pypiCache = {};
-const API_BASE = 'http://146.88.194.12:8080';
+const API_BASE = '';
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -465,8 +465,8 @@ async function loadSoftware() {
   const el = document.getElementById('page-software');
   el.innerHTML = '<div class="text-gray-500 text-center py-12"><div class="shimmer inline-block w-48 h-4 rounded mb-2"></div><div class="text-sm mt-2">Loading software inventory...</div></div>';
   const [h200, rtx] = await Promise.all([
-    fetch(API_BASE+'/api/h200/software').then(r=>r.json()).catch(()=>null),
-    fetch(API_BASE+'/api/rtx5090/software').then(r=>r.json()).catch(()=>null),
+    fetch('/api/gpu?server=h200&endpoint=software').then(r=>r.json()).catch(()=>null),
+    fetch('/api/gpu?server=rtx5090&endpoint=software').then(r=>r.json()).catch(()=>null),
   ]);
   softwareData.h200 = h200;
   softwareData.rtx5090 = rtx;
@@ -574,12 +574,12 @@ function renderAll() {
 
 // ── Data Fetching ──
 async function fetchServer(key) {
-  try { const r = await fetch(API_BASE+'/api/'+key); return await r.json(); }
+  try { const r = await fetch('/api/gpu?server='+key); return await r.json(); }
   catch(e) { return { server_name: key, status:'offline', error: e.message }; }
 }
 
 async function fetchHistory(key) {
-  try { const r = await fetch(API_BASE+'/api/'+key+'/history'); const d = await r.json(); return d.history || []; }
+  try { const r = await fetch('/api/gpu?server='+key+'&endpoint=history'); const d = await r.json(); return d.history || []; }
   catch(e) { return []; }
 }
 

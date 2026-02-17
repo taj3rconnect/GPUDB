@@ -14,16 +14,17 @@ class handler(BaseHTTPRequestHandler):
         server_key = params.get("server", [None])[0]
         endpoint = params.get("endpoint", ["data"])[0]
 
-        if server_key not in ("h200", "rtx5090"):
+        # Special case: agent endpoint (no server_key needed)
+        if endpoint == "agent":
+            upstream = f"{H200_API}/api/agent"
+        elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": "Use ?server=h200 or ?server=rtx5090"}).encode())
+            self.wfile.write(json.dumps({"error": "Use ?server=h200 or ?server=rtx5090 or ?endpoint=agent"}).encode())
             return
-
-        # Build upstream URL
-        if endpoint == "history":
+        elif endpoint == "history":
             upstream = f"{H200_API}/api/{server_key}/history"
         elif endpoint == "software":
             upstream = f"{H200_API}/api/{server_key}/software"

@@ -1705,7 +1705,8 @@ async def alert_monitor_loop():
     await asyncio.sleep(10)  # wait for app to warm up
     while True:
         try:
-            if email_config["enabled"] and email_config["recipients"] and SENDGRID_API_KEY and not _is_quiet_hours():
+            if email_config["enabled"] and email_config["recipients"] and SENDGRID_API_KEY:
+                quiet = _is_quiet_hours()
                 now = time.time()
                 cooldown_sec = email_config["cooldown_minutes"] * 60
                 all_triggered = []
@@ -1715,8 +1716,13 @@ async def alert_monitor_loop():
                         data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=15)
                     except Exception:
                         data = None
+                        all_triggered.append({"rule": "server_offline", "server": SERVERS[sk]["name"], "gpu": "cluster", "severity": "critical", "title": f"{SERVERS[sk]['name']} — Connection Failed", "value": "unreachable", "threshold": "online"})
                     alerts = evaluate_alerts_from_data(data, SERVERS[sk]["name"])
                     all_triggered.extend(alerts)
+
+                # During quiet hours, only allow critical alerts through
+                if quiet:
+                    all_triggered = [a for a in all_triggered if a["severity"] == "critical"]
 
                 # Filter by cooldown
                 to_send = []
@@ -1731,7 +1737,8 @@ async def alert_monitor_loop():
                     # Group: only send critical+warning
                     critical = [a for a in to_send if a["severity"] in ("critical", "warning")]
                     if critical:
-                        subject = f"[GPU Alert] {len(critical)} alert(s) — {critical[0]['title']}"
+                        prefix = "[CRITICAL - Quiet Hours Override] " if quiet else "[GPU Alert] "
+                        subject = f"{prefix}{len(critical)} alert(s) — {critical[0]['title']}"
                         result = await send_alert_email(email_config["recipients"], subject, critical)
                         email_history.appendleft({
                             "t": now,

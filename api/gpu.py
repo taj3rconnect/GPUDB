@@ -45,6 +45,8 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/email-config"
         elif endpoint == "email-test":
             upstream = f"{H200_API}/api/email-test"
+        elif endpoint == "anomalies":
+            upstream = f"{H200_API}/api/anomalies"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

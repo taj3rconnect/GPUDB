@@ -1283,6 +1283,159 @@ async def update_sla(request: Request):
     return {"ok": True, "targets": sla_targets}
 
 
+@app.get("/api/anomalies")
+async def get_anomalies():
+    """Anomaly Detection — rolling z-score analysis on GPU metrics, traffic, memory, errors."""
+    import math
+    now = time.time()
+    anomalies = []
+    metric_stats = {}  # for the UI: {metric_key: {mean, std, current, z, history[]}}
+
+    def z_score_analysis(values, label, server_name, threshold=2.5, direction="both"):
+        """Compute rolling z-scores. Returns anomalies where |z| > threshold."""
+        if len(values) < 10:
+            return [], None
+        mean = sum(values) / len(values)
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        std = math.sqrt(variance) if variance > 0 else 0.001
+        current = values[-1]
+        z = (current - mean) / std
+        recent_zs = [(values[i] - mean) / std for i in range(max(0, len(values) - 60), len(values))]
+
+        found = []
+        if direction == "both" and abs(z) > threshold:
+            found.append({"z": round(z, 2), "value": round(current, 2), "mean": round(mean, 2), "std": round(std, 2)})
+        elif direction == "high" and z > threshold:
+            found.append({"z": round(z, 2), "value": round(current, 2), "mean": round(mean, 2), "std": round(std, 2)})
+        elif direction == "low" and z < -threshold:
+            found.append({"z": round(z, 2), "value": round(current, 2), "mean": round(mean, 2), "std": round(std, 2)})
+
+        stats = {
+            "mean": round(mean, 2),
+            "std": round(std, 2),
+            "current": round(current, 2),
+            "z": round(z, 2),
+            "recent_zs": [round(zv, 2) for zv in recent_zs[-30:]],
+            "is_anomaly": len(found) > 0,
+            "server": server_name,
+            "label": label,
+        }
+        return found, stats
+
+    for sk in SERVERS:
+        sname = SERVERS[sk]["name"]
+        hist = list(history.get(sk, []))
+        if len(hist) < 10:
+            continue
+
+        # Extract time series from history
+        gpu_count = len(hist[-1].get("gpus", [])) if hist else 0
+
+        # ── Per-GPU metrics ──
+        for gpu_idx in range(gpu_count):
+            utils = [h["gpus"][gpu_idx].get("gpu_util", 0) for h in hist if len(h.get("gpus", [])) > gpu_idx]
+            temps = [h["gpus"][gpu_idx].get("temp", 0) or 0 for h in hist if len(h.get("gpus", [])) > gpu_idx]
+            mem_pcts = [(h["gpus"][gpu_idx]["mem_used"] / max(h["gpus"][gpu_idx]["mem_total"], 1) * 100) for h in hist if len(h.get("gpus", [])) > gpu_idx]
+            powers = [h["gpus"][gpu_idx].get("power_draw", 0) for h in hist if len(h.get("gpus", [])) > gpu_idx]
+
+            # Utilization anomaly (sudden drops)
+            found, stats = z_score_analysis(utils, f"GPU {gpu_idx} Utilization", sname, threshold=2.5, direction="both")
+            key = f"{sk}_gpu{gpu_idx}_util"
+            if stats:
+                metric_stats[key] = stats
+            for f in found:
+                anomalies.append({"t": now, "type": "util_anomaly", "severity": "warning" if abs(f["z"]) < 3.5 else "critical",
+                    "title": f"GPU {gpu_idx} utilization anomaly on {sname}", "detail": f"Current: {f['value']}% (mean: {f['mean']}%, z={f['z']})", "server": sk, "gpu": gpu_idx, **f})
+
+            # Temperature anomaly (sudden spikes)
+            found, stats = z_score_analysis(temps, f"GPU {gpu_idx} Temperature", sname, threshold=2.5, direction="high")
+            key = f"{sk}_gpu{gpu_idx}_temp"
+            if stats:
+                metric_stats[key] = stats
+            for f in found:
+                anomalies.append({"t": now, "type": "temp_anomaly", "severity": "warning" if f["z"] < 3.5 else "critical",
+                    "title": f"GPU {gpu_idx} temp spike on {sname}", "detail": f"Current: {f['value']}C (mean: {f['mean']}C, z={f['z']})", "server": sk, "gpu": gpu_idx, **f})
+
+            # Memory leak detection (steady upward trend)
+            found, stats = z_score_analysis(mem_pcts, f"GPU {gpu_idx} VRAM", sname, threshold=2.0, direction="high")
+            key = f"{sk}_gpu{gpu_idx}_vram"
+            if stats:
+                metric_stats[key] = stats
+            # Also check for monotonic increase (memory leak pattern)
+            if len(mem_pcts) >= 20:
+                recent = mem_pcts[-20:]
+                increases = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+                if increases >= 16:  # 80%+ of samples increasing
+                    delta = recent[-1] - recent[0]
+                    anomalies.append({"t": now, "type": "memory_leak", "severity": "warning",
+                        "title": f"GPU {gpu_idx} possible memory leak on {sname}",
+                        "detail": f"VRAM rose {delta:.1f}% over last 20 samples ({increases}/20 increases)",
+                        "server": sk, "gpu": gpu_idx, "z": 0, "value": round(recent[-1], 1), "mean": round(sum(recent)/len(recent), 1), "std": 0})
+
+            # Power anomaly
+            found, stats = z_score_analysis(powers, f"GPU {gpu_idx} Power", sname, threshold=2.5, direction="both")
+            key = f"{sk}_gpu{gpu_idx}_power"
+            if stats:
+                metric_stats[key] = stats
+            for f in found:
+                anomalies.append({"t": now, "type": "power_anomaly", "severity": "warning",
+                    "title": f"GPU {gpu_idx} power anomaly on {sname}", "detail": f"Current: {f['value']}W (mean: {f['mean']}W, z={f['z']})", "server": sk, "gpu": gpu_idx, **f})
+
+        # ── Aggregate server metrics ──
+        avg_utils = [sum(h["gpus"][i].get("gpu_util", 0) for i in range(len(h.get("gpus", [])))) / max(len(h.get("gpus", [])), 1) for h in hist if h.get("gpus")]
+        total_powers = [sum(h["gpus"][i].get("power_draw", 0) for i in range(len(h.get("gpus", [])))) for h in hist if h.get("gpus")]
+
+        found, stats = z_score_analysis(avg_utils, f"Avg Utilization", sname, threshold=2.5, direction="both")
+        if stats:
+            metric_stats[f"{sk}_avg_util"] = stats
+        for f in found:
+            anomalies.append({"t": now, "type": "fleet_util_anomaly", "severity": "warning",
+                "title": f"Fleet utilization anomaly on {sname}", "detail": f"Avg util: {f['value']}% (mean: {f['mean']}%, z={f['z']})", "server": sk, "gpu": -1, **f})
+
+        found, stats = z_score_analysis(total_powers, f"Total Power", sname, threshold=2.5, direction="both")
+        if stats:
+            metric_stats[f"{sk}_total_power"] = stats
+        for f in found:
+            anomalies.append({"t": now, "type": "fleet_power_anomaly", "severity": "warning",
+                "title": f"Total power anomaly on {sname}", "detail": f"Total: {f['value']}W (mean: {f['mean']}W, z={f['z']})", "server": sk, "gpu": -1, **f})
+
+        # ── Error rate anomalies ──
+        errs = list(error_history.get(sk, []))
+        if len(errs) >= 10:
+            rates = [e.get("rate", 0) for e in errs]
+            found, stats = z_score_analysis(rates, f"Error Rate", sname, threshold=2.0, direction="high")
+            if stats:
+                metric_stats[f"{sk}_error_rate"] = stats
+            for f in found:
+                anomalies.append({"t": now, "type": "error_spike", "severity": "critical" if f["z"] > 3 else "warning",
+                    "title": f"Error rate spike on {sname}", "detail": f"Rate: {f['value']}% (mean: {f['mean']}%, z={f['z']})", "server": sk, "gpu": -1, **f})
+
+    # Sort by severity then z-score
+    sev_order = {"critical": 0, "warning": 1, "info": 2}
+    anomalies.sort(key=lambda a: (sev_order.get(a.get("severity"), 9), -abs(a.get("z", 0))))
+
+    # Summary
+    return {
+        "anomalies": anomalies,
+        "metric_stats": metric_stats,
+        "summary": {
+            "total_anomalies": len(anomalies),
+            "critical": len([a for a in anomalies if a["severity"] == "critical"]),
+            "warning": len([a for a in anomalies if a["severity"] == "warning"]),
+            "metrics_monitored": len(metric_stats),
+            "by_type": {
+                "util_anomaly": len([a for a in anomalies if a["type"] == "util_anomaly"]),
+                "temp_anomaly": len([a for a in anomalies if a["type"] == "temp_anomaly"]),
+                "memory_leak": len([a for a in anomalies if a["type"] == "memory_leak"]),
+                "power_anomaly": len([a for a in anomalies if a["type"] == "power_anomaly"]),
+                "error_spike": len([a for a in anomalies if a["type"] == "error_spike"]),
+                "fleet_util_anomaly": len([a for a in anomalies if a["type"] == "fleet_util_anomaly"]),
+                "fleet_power_anomaly": len([a for a in anomalies if a["type"] == "fleet_power_anomaly"]),
+            },
+        },
+    }
+
+
 # ── SendGrid Email Alerts ─────────────────────────────────────
 async def send_alert_email(recipients: list, subject: str, alerts: list) -> dict:
     """Send alert email via SendGrid API. Returns {ok, detail}."""
@@ -3317,6 +3470,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('incidents')" id="tab-incidents">Incidents</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('alertsconfig')" id="tab-alertsconfig">Alert Config</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('sla')" id="tab-sla">SLA</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('anomalies')" id="tab-anomalies">Anomalies</button>
 </div>
 
 <!-- Content -->
@@ -3339,6 +3493,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-incidents" class="hidden"></div>
   <div id="page-alertsconfig" class="hidden"></div>
   <div id="page-sla" class="hidden"></div>
+  <div id="page-anomalies" class="hidden"></div>
 </div>
 
 <script>
@@ -3368,6 +3523,7 @@ let powerData = null;
 let incidentsData = null;
 let alertsconfigData = null;
 let slaData = null;
+let anomaliesData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -3404,7 +3560,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power','incidents','alertsconfig','sla'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power','incidents','alertsconfig','sla','anomalies'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -3424,6 +3580,7 @@ function switchTab(tab) {
   if (tab === 'incidents') loadIncidents();
   if (tab === 'alertsconfig') loadAlertsConfig();
   if (tab === 'sla') loadSLA();
+  if (tab === 'anomalies') loadAnomalies();
 }
 
 // ── Overview Tab ──
@@ -5102,6 +5259,7 @@ function renderAll() {
   else if (activeTab === 'incidents') renderIncidents();
   else if (activeTab === 'alertsconfig') renderAlertsConfig();
   else if (activeTab === 'sla') renderSLA();
+  else if (activeTab === 'anomalies') renderAnomalies();
 }
 
 // ── Live Call Tracker Tab ──
@@ -5573,6 +5731,107 @@ function renderSLA() {
     html += '</div>';
   }
   html += '</div>';
+
+  el.innerHTML = html;
+}
+
+// ── Anomaly Detection Tab ──
+async function loadAnomalies() {
+  try { const r = await fetch('/api/anomalies'); anomaliesData = await r.json(); renderAnomalies(); } catch(e) { console.error(e); }
+}
+function renderAnomalies() {
+  const el = document.getElementById('page-anomalies');
+  if (!anomaliesData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = anomaliesData;
+  const s = d.summary || {};
+
+  // Summary cards
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Anomaly Detection</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Rolling z-score analysis across all GPU metrics — flags deviations > 2.5&sigma;</p>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  const statusC = s.total_anomalies === 0 ? 'text-emerald-400' : s.critical > 0 ? 'text-red-400' : 'text-amber-400';
+  const statusText = s.total_anomalies === 0 ? 'ALL NORMAL' : s.critical > 0 ? 'CRITICAL' : 'WARNING';
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-2xl font-bold ${statusC}">${statusText}</div><div class="text-[10px] text-gray-500 mt-1">Status</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-white">${s.total_anomalies||0}</div><div class="text-[10px] text-gray-500 mt-1">Anomalies</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-red-400">${s.critical||0}</div><div class="text-[10px] text-gray-500 mt-1">Critical</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-gray-300">${s.metrics_monitored||0}</div><div class="text-[10px] text-gray-500 mt-1">Metrics Tracked</div></div>`;
+  html += '</div>';
+
+  // Type breakdown
+  const bt = s.by_type || {};
+  if (Object.keys(bt).length > 0) {
+    html += '<div class="grid grid-cols-3 md:grid-cols-7 gap-2 mb-4">';
+    const icons = {util_anomaly:'📊',temp_anomaly:'🌡',memory_leak:'💾',power_anomaly:'⚡',error_spike:'⚠',fleet_util_anomaly:'🏭',fleet_power_anomaly:'🔌'};
+    const labels = {util_anomaly:'Utilization',temp_anomaly:'Temperature',memory_leak:'Memory Leak',power_anomaly:'Power',error_spike:'Error Rate',fleet_util_anomaly:'Fleet Util',fleet_power_anomaly:'Fleet Power'};
+    for (const [type, count] of Object.entries(bt)) {
+      const c = count > 0 ? 'text-amber-400 border-amber-500/30' : 'text-emerald-400 border-emerald-500/20';
+      html += `<div class="glass-bright rounded-lg p-2 text-center text-[10px] border ${count>0?'border-amber-500/30':'border-transparent'}">`;
+      html += `<div class="text-sm">${icons[type]||'📈'}</div><div class="${c} font-medium">${count}</div><div class="text-gray-500">${labels[type]||type}</div></div>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Active anomalies list
+  if ((d.anomalies||[]).length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-4">Active Anomalies</h3>';
+    html += '<div class="space-y-2">';
+    for (const a of d.anomalies) {
+      const sevC = a.severity === 'critical' ? 'border-red-500 bg-red-500/10' : 'border-amber-500 bg-amber-500/10';
+      const sevT = a.severity === 'critical' ? 'text-red-400' : 'text-amber-400';
+      const zAbs = Math.abs(a.z||0);
+      const zBar = Math.min(zAbs / 5 * 100, 100);
+      const zC = zAbs > 3.5 ? 'bg-red-500/60' : zAbs > 2.5 ? 'bg-amber-500/60' : 'bg-blue-500/40';
+      html += `<div class="border-l-2 ${sevC} rounded-r-lg p-3">`;
+      html += `<div class="flex justify-between items-start mb-1">`;
+      html += `<div><span class="${sevT} text-xs font-medium">${a.severity.toUpperCase()}</span> <span class="text-white text-sm ml-2">${a.title}</span></div>`;
+      html += `<span class="text-xs text-gray-400 font-mono">z=${a.z}</span></div>`;
+      html += `<div class="text-[10px] text-gray-400 mb-2">${a.detail}</div>`;
+      html += `<div class="flex items-center gap-2"><span class="text-[9px] text-gray-500 w-8">|z|</span>`;
+      html += `<div class="flex-1 h-2 rounded bg-gray-800"><div class="${zC} h-2 rounded" style="width:${zBar}%"></div></div>`;
+      html += `<span class="text-[9px] text-gray-500 w-8">${zAbs.toFixed(1)}</span></div>`;
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+
+  // Metric health grid
+  const ms = d.metric_stats || {};
+  const keys = Object.keys(ms);
+  if (keys.length > 0) {
+    html += '<div class="glass rounded-xl p-6"><h3 class="text-white font-semibold mb-1">Metric Health Grid</h3>';
+    html += '<p class="text-xs text-gray-500 mb-4">Current z-score for each tracked metric — green is normal</p>';
+    html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-2">';
+    for (const [key, m] of Object.entries(ms)) {
+      const z = Math.abs(m.z||0);
+      const borderC = m.is_anomaly ? 'border-red-500/50' : z > 1.5 ? 'border-amber-500/30' : 'border-emerald-500/20';
+      const zC = m.is_anomaly ? 'text-red-400' : z > 1.5 ? 'text-amber-400' : 'text-emerald-400';
+      html += `<div class="glass-bright rounded-lg p-3 border ${borderC}">`;
+      html += `<div class="flex justify-between items-center mb-1"><span class="text-[10px] text-gray-400 truncate">${m.label}</span><span class="text-[9px] text-gray-600">${m.server}</span></div>`;
+      html += `<div class="flex items-baseline gap-2"><span class="text-sm font-bold ${zC}">z=${m.z}</span><span class="text-[10px] text-gray-500">${m.current} (μ=${m.mean})</span></div>`;
+      // Mini z-score sparkline
+      const zs = m.recent_zs || [];
+      if (zs.length > 1) {
+        const maxZ = Math.max(...zs.map(v=>Math.abs(v)), 3);
+        const w = 100; const h = 20;
+        const step = w / (zs.length - 1);
+        let path = '';
+        zs.forEach((v, i) => {
+          const x = i * step;
+          const y = h/2 - (v / maxZ) * (h/2 - 1);
+          path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+        });
+        html += `<svg width="${w}" height="${h}" class="mt-1"><line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="rgba(255,255,255,0.06)" stroke-width="1"/>`;
+        html += `<path d="${path}" fill="none" stroke="${m.is_anomaly?'#ef4444':'#22c55e'}" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+      }
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+
+  if ((d.anomalies||[]).length === 0 && keys.length === 0) {
+    html += '<div class="glass rounded-xl p-12 text-center"><div class="text-gray-500">Not enough history data yet. Anomaly detection needs ~10 samples to begin analysis.</div></div>';
+  }
 
   el.innerHTML = html;
 }

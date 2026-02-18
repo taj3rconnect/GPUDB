@@ -1919,21 +1919,250 @@ async def generate_daily_report():
     return html
 
 
+def generate_report_pdf(server_summaries, all_alerts, emails_24h, report_date, report_time):
+    """Generate a PDF report using reportlab. Returns PDF bytes."""
+    import io
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib.colors import HexColor, white, black
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Spacer, Paragraph, HRFlowable
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch, leftMargin=0.6*inch, rightMargin=0.6*inch)
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='Title2', fontName='Helvetica-Bold', fontSize=18, textColor=HexColor('#1a1a2e'), spaceAfter=4))
+    styles.add(ParagraphStyle(name='Sub', fontName='Helvetica', fontSize=9, textColor=HexColor('#6b7280'), spaceAfter=12))
+    styles.add(ParagraphStyle(name='Section', fontName='Helvetica-Bold', fontSize=12, textColor=HexColor('#1a1a2e'), spaceBefore=14, spaceAfter=6))
+    styles.add(ParagraphStyle(name='Cell', fontName='Helvetica', fontSize=9, textColor=HexColor('#333333')))
+    styles.add(ParagraphStyle(name='CellBold', fontName='Helvetica-Bold', fontSize=9, textColor=HexColor('#333333')))
+    styles.add(ParagraphStyle(name='Small', fontName='Helvetica', fontSize=8, textColor=HexColor('#6b7280')))
+    styles.add(ParagraphStyle(name='Footer', fontName='Helvetica', fontSize=7, textColor=HexColor('#9ca3af'), alignment=1))
+
+    elements = []
+
+    # Header
+    elements.append(Paragraph("GPU Fleet Daily Report", styles['Title2']))
+    elements.append(Paragraph(f"{report_date} &middot; Generated at {report_time}", styles['Sub']))
+
+    # Summary cards
+    crit_count = sum(1 for a in all_alerts if a.get("severity") == "critical")
+    warn_count = sum(1 for a in all_alerts if a.get("severity") == "warning")
+    health = "Healthy" if crit_count == 0 and warn_count <= 2 else "Warning" if crit_count == 0 else "Critical"
+    health_color = HexColor('#22c55e') if health == "Healthy" else HexColor('#f59e0b') if health == "Warning" else HexColor('#ef4444')
+
+    summary_data = [
+        [Paragraph("<b>Fleet Health</b>", styles['Cell']), Paragraph("<b>Servers</b>", styles['Cell']), Paragraph("<b>Critical</b>", styles['Cell']), Paragraph("<b>Warnings</b>", styles['Cell'])],
+        [Paragraph(f"<b>{health}</b>", ParagraphStyle('h', parent=styles['CellBold'], textColor=health_color, fontSize=14)),
+         Paragraph(f"<b>{len(server_summaries)}</b>", ParagraphStyle('s', parent=styles['CellBold'], fontSize=14)),
+         Paragraph(f"<b>{crit_count}</b>", ParagraphStyle('c', parent=styles['CellBold'], textColor=HexColor('#ef4444') if crit_count else HexColor('#22c55e'), fontSize=14)),
+         Paragraph(f"<b>{warn_count}</b>", ParagraphStyle('w', parent=styles['CellBold'], textColor=HexColor('#f59e0b') if warn_count else HexColor('#22c55e'), fontSize=14))],
+    ]
+    t = Table(summary_data, colWidths=[1.7*inch]*4)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), HexColor('#f3f4f6')),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('GRID', (0,0), (-1,-1), 0.5, HexColor('#e5e7eb')),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('ROUNDEDCORNERS', [4,4,4,4]),
+    ]))
+    elements.append(t)
+
+    # Server Status
+    elements.append(Paragraph("Server Status", styles['Section']))
+    elements.append(HRFlowable(width="100%", thickness=1, color=HexColor('#e5e7eb')))
+    elements.append(Spacer(1, 6))
+
+    for s in server_summaries:
+        if s["status"] == "Offline":
+            srv_data = [[Paragraph(f"<b>{s['name']}</b>", styles['CellBold']), Paragraph("<b>OFFLINE</b>", ParagraphStyle('off', parent=styles['CellBold'], textColor=HexColor('#ef4444')))]]
+            st = Table(srv_data, colWidths=[4*inch, 2.8*inch])
+            st.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), HexColor('#fef2f2')), ('GRID', (0,0), (-1,-1), 0.5, HexColor('#fca5a5')), ('TOPPADDING', (0,0), (-1,-1), 8), ('BOTTOMPADDING', (0,0), (-1,-1), 8)]))
+            elements.append(st)
+            elements.append(Spacer(1, 6))
+            continue
+
+        uptime_d = s["uptime"] // 86400
+        uptime_h = (s["uptime"] % 86400) // 3600
+        srv_header = [[
+            Paragraph(f"<b>{s['name']}</b> &nbsp; <font size=8 color='#6b7280'>{s['gpu_count']} GPUs</font>", styles['CellBold']),
+            Paragraph(f"<font color='#22c55e'>Online</font> &middot; Up {uptime_d}d {uptime_h}h", ParagraphStyle('up', parent=styles['Small'], alignment=2)),
+        ]]
+        metrics = [
+            ['GPU Utilization', f"Avg {s['avg_util']:.0f}%", f"Peak {s['peak_util']:.0f}%"],
+            ['Temperature', f"Avg {s['avg_temp']:.0f}\u00b0C", f"Peak {s['peak_temp']:.0f}\u00b0C"],
+            ['VRAM Usage', f"{s['vram_pct']:.0f}%", f"{s['vram_used']//1024:.0f}/{s['vram_total']//1024:.0f} GiB"],
+            ['Power Draw', f"{s['total_power']:.0f}W current", f"Peak {s['peak_power']:.0f}W"],
+        ]
+        if s.get("ecc_errors"):
+            metrics.append(['ECC Errors', str(s["ecc_errors"]), ''])
+
+        srv_data = srv_header + [[Paragraph(m[0], styles['Cell']), Paragraph(m[1], styles['CellBold']), Paragraph(m[2], styles['Small'])] for m in metrics]
+        col_w = [2.2*inch, 2.4*inch, 2.2*inch]
+        st = Table(srv_data, colWidths=col_w)
+        sty = [
+            ('BACKGROUND', (0,0), (-1,0), HexColor('#f0fdf4')),
+            ('SPAN', (0,0), (0,0)),
+            ('GRID', (0,0), (-1,-1), 0.5, HexColor('#e5e7eb')),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('LEFTPADDING', (0,0), (-1,-1), 8),
+        ]
+        # Color high values
+        for i, m in enumerate(metrics):
+            row = i + 1
+            if 'Utilization' in m[0]:
+                val = s['peak_util']
+                if val > 95: sty.append(('TEXTCOLOR', (2, row), (2, row), HexColor('#ef4444')))
+            elif 'Temp' in m[0]:
+                if s['peak_temp'] > 80: sty.append(('TEXTCOLOR', (2, row), (2, row), HexColor('#ef4444')))
+                elif s['peak_temp'] > 60: sty.append(('TEXTCOLOR', (2, row), (2, row), HexColor('#f59e0b')))
+            elif 'VRAM' in m[0]:
+                if s['vram_pct'] > 90: sty.append(('TEXTCOLOR', (1, row), (1, row), HexColor('#ef4444')))
+        st.setStyle(TableStyle(sty))
+        elements.append(st)
+        elements.append(Spacer(1, 8))
+
+    # Active Alerts
+    elements.append(Paragraph(f"Active Alerts ({len(all_alerts)})", styles['Section']))
+    elements.append(HRFlowable(width="100%", thickness=1, color=HexColor('#e5e7eb')))
+    elements.append(Spacer(1, 4))
+
+    if all_alerts:
+        alert_data = [['Severity', 'Alert', 'Detail']]
+        for a in all_alerts[:20]:
+            sev = a.get("severity", "info").upper()
+            alert_data.append([sev, a.get("title", ""), a.get("detail", "")[:60]])
+        at = Table(alert_data, colWidths=[1*inch, 3.2*inch, 2.6*inch])
+        at_sty = [
+            ('BACKGROUND', (0,0), (-1,0), HexColor('#f3f4f6')),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('GRID', (0,0), (-1,-1), 0.5, HexColor('#e5e7eb')),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('LEFTPADDING', (0,0), (-1,-1), 6),
+        ]
+        for i, a in enumerate(all_alerts[:20]):
+            row = i + 1
+            sev = a.get("severity", "")
+            if sev == "critical": at_sty.append(('TEXTCOLOR', (0, row), (0, row), HexColor('#ef4444')))
+            elif sev == "warning": at_sty.append(('TEXTCOLOR', (0, row), (0, row), HexColor('#f59e0b')))
+            else: at_sty.append(('TEXTCOLOR', (0, row), (0, row), HexColor('#3b82f6')))
+        at.setStyle(TableStyle(at_sty))
+        elements.append(at)
+    else:
+        elements.append(Paragraph("No alerts in the last 24 hours.", styles['Small']))
+
+    # Email Notifications
+    if emails_24h:
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(f"Email Notifications Sent ({len(emails_24h)})", styles['Section']))
+        email_data = [['Time', 'Subject', 'Status']]
+        for e in emails_24h[:10]:
+            ts = time.strftime("%I:%M %p", time.localtime(e["t"]))
+            email_data.append([ts, e.get("subject", "")[:50], e.get("status", "")])
+        et = Table(email_data, colWidths=[1*inch, 4.2*inch, 1.6*inch])
+        et.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), HexColor('#f3f4f6')),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('GRID', (0,0), (-1,-1), 0.5, HexColor('#e5e7eb')),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ]))
+        elements.append(et)
+
+    # Footer
+    elements.append(Spacer(1, 20))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=HexColor('#e5e7eb')))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(f"GPU Admin Dashboard &middot; Auto-generated daily report &middot; {report_date}", styles['Footer']))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 async def send_daily_report():
-    """Generate and email the daily report."""
+    """Generate and email the daily report as PDF attachment."""
     html = await generate_daily_report()
     if not SENDGRID_API_KEY or not email_config["recipients"]:
         last_report["status"] = "no_config"
         return
     from datetime import datetime, timezone, timedelta
+    import base64
     est = timezone(timedelta(hours=-5))
-    date_str = datetime.now(est).strftime("%b %d, %Y")
+    now_est = datetime.now(est)
+    date_str = now_est.strftime("%b %d, %Y")
+    date_file = now_est.strftime("%Y-%m-%d")
     subject = f"[GPU Dashboard] Daily Report — {date_str}"
+
+    # Generate PDF
+    cutoff = time.time() - 86400
+    server_summaries = []
+    all_alerts = []
+    for sk in SERVERS:
+        try:
+            data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=15)
+        except Exception:
+            data = None
+        sname = SERVERS[sk]["name"]
+        if data and data.get("status") != "offline":
+            gpus = data.get("gpus", [])
+            avg_util = sum(g.get("utilization", 0) for g in gpus) / max(len(gpus), 1)
+            max_temp = max((g.get("temperature", 0) for g in gpus), default=0)
+            avg_temp = sum(g.get("temperature", 0) for g in gpus) / max(len(gpus), 1)
+            total_power = sum(g.get("power_draw", 0) for g in gpus)
+            vram_used = sum(g.get("memory_used", 0) for g in gpus)
+            vram_total = sum(g.get("memory_total", 0) for g in gpus)
+            vram_pct = (vram_used / vram_total * 100) if vram_total else 0
+            peak_util, peak_temp, peak_power = 0, 0, 0
+            for h in history.get(sk, []):
+                if h.get("t", 0) < cutoff:
+                    continue
+                for g in h.get("gpus", []):
+                    peak_util = max(peak_util, g.get("utilization", 0))
+                    peak_temp = max(peak_temp, g.get("temperature", 0))
+                    peak_power = max(peak_power, g.get("power_draw", 0))
+            server_summaries.append({
+                "name": sname, "status": "Online", "gpu_count": len(gpus),
+                "avg_util": avg_util, "peak_util": peak_util,
+                "avg_temp": avg_temp, "max_temp": max_temp, "peak_temp": peak_temp,
+                "total_power": total_power, "peak_power": peak_power,
+                "vram_pct": vram_pct, "vram_used": vram_used, "vram_total": vram_total,
+                "ecc_errors": sum(g.get("ecc_errors", 0) for g in gpus), "uptime": data.get("uptime", 0),
+            })
+        else:
+            server_summaries.append({"name": sname, "status": "Offline"})
+            all_alerts.append({"severity": "critical", "title": f"{sname} — Offline/Unreachable"})
+        al = evaluate_alerts_from_data(data, sname)
+        all_alerts.extend(al)
+
+    emails_24h = [e for e in email_history if e.get("t", 0) >= cutoff]
+    report_date_full = now_est.strftime("%B %d, %Y")
+    report_time = now_est.strftime("%I:%M %p EST")
+
+    pdf_bytes = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: generate_report_pdf(server_summaries, all_alerts, emails_24h, report_date_full, report_time)
+    )
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    last_report["pdf_bytes"] = len(pdf_bytes)
+
     payload = {
         "personalizations": [{"to": [{"email": r} for r in email_config["recipients"]]}],
         "from": {"email": SENDGRID_MAIL_FROM, "name": "GPU Dashboard"},
         "subject": subject,
-        "content": [{"type": "text/html", "value": html}],
+        "content": [{"type": "text/html", "value": "<p>Please find the GPU Fleet Daily Report attached.</p><p style='color:#6b7280;font-size:12px'>GPU Admin Dashboard &middot; Auto-generated</p>"}],
+        "attachments": [{
+            "content": pdf_b64,
+            "filename": f"GPU_Report_{date_file}.pdf",
+            "type": "application/pdf",
+            "disposition": "attachment",
+        }],
     }
     try:
         data = json.dumps(payload).encode()
@@ -1944,7 +2173,7 @@ async def send_daily_report():
             method="POST",
         )
         ctx = ssl.create_default_context()
-        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: urlopen(req, context=ctx, timeout=15))
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: urlopen(req, context=ctx, timeout=30))
         last_report["sent_at"] = time.time()
         last_report["status"] = "sent" if resp.status in (200, 201, 202) else f"http_{resp.status}"
     except Exception as e:

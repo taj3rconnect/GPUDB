@@ -1,9 +1,12 @@
 import asyncio
 import json
+import os
 import time
 import re
+import ssl
 from collections import deque
 from pathlib import Path
+from urllib.request import urlopen, Request as URLRequest
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +78,29 @@ disk_history = {k: deque(maxlen=480) for k in SERVERS}  # ~24h at 3min intervals
 gpu_clock_history = {k: {} for k in SERVERS}
 # Call volume by hour-of-day for forecasting: {dow_hour: [call_counts]}
 call_volume_patterns = {}
+
+# ── Email Alert Config ────────────────────────────────────────
+# Load SendGrid credentials from .env file
+def _load_env():
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_MAIL_FROM = os.environ.get("SENDGRID_MAIL_FROM", "no-reply@jobtalk.ai")
+
+email_config = {
+    "enabled": True,
+    "recipients": ["taj@jobtalk.ai"],
+    "cooldown_minutes": 30,
+}
+email_cooldowns = {}  # {alert_key: last_sent_timestamp}
+email_history = deque(maxlen=100)  # {t, to, subject, alerts_count, status, detail}
 
 
 # ── Command Helpers ────────────────────────────────────────────
@@ -1255,6 +1281,222 @@ async def update_sla(request: Request):
     if "target" in body:
         sla_targets[sla_id]["target"] = float(body["target"])
     return {"ok": True, "targets": sla_targets}
+
+
+# ── SendGrid Email Alerts ─────────────────────────────────────
+async def send_alert_email(recipients: list, subject: str, alerts: list) -> dict:
+    """Send alert email via SendGrid API. Returns {ok, detail}."""
+    if not SENDGRID_API_KEY:
+        return {"ok": False, "detail": "SENDGRID_API_KEY not set"}
+    if not recipients:
+        return {"ok": False, "detail": "No recipients"}
+
+    # Build HTML body
+    rows = ""
+    for a in alerts:
+        sev_color = "#ef4444" if a.get("severity") == "critical" else "#f59e0b" if a.get("severity") == "warning" else "#3b82f6"
+        rows += f'<tr><td style="padding:8px;border-bottom:1px solid #333;color:{sev_color};font-weight:bold">{a.get("severity","").upper()}</td>'
+        rows += f'<td style="padding:8px;border-bottom:1px solid #333;color:#fff">{a.get("title","")}</td>'
+        rows += f'<td style="padding:8px;border-bottom:1px solid #333;color:#999">{a.get("detail","")}</td></tr>'
+
+    html = f"""<div style="background:#0a0a0f;padding:24px;font-family:Inter,sans-serif;color:#e5e7eb">
+    <div style="max-width:600px;margin:0 auto">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+            <div style="width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#10b981,#06b6d4);display:flex;align-items:center;justify-content:center">
+                <span style="color:#fff;font-size:20px">⚡</span>
+            </div>
+            <div>
+                <h1 style="margin:0;color:#fff;font-size:18px">GPU Alert</h1>
+                <p style="margin:0;color:#6b7280;font-size:12px">{subject}</p>
+            </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px">
+            <thead><tr style="border-bottom:1px solid #333">
+                <th style="padding:10px;text-align:left;color:#9ca3af;font-size:12px">Severity</th>
+                <th style="padding:10px;text-align:left;color:#9ca3af;font-size:12px">Alert</th>
+                <th style="padding:10px;text-align:left;color:#9ca3af;font-size:12px">Detail</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        <p style="margin-top:16px;color:#6b7280;font-size:11px">Sent from GPU Admin Dashboard · {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</p>
+    </div></div>"""
+
+    payload = {
+        "personalizations": [{"to": [{"email": r} for r in recipients]}],
+        "from": {"email": SENDGRID_MAIL_FROM, "name": "GPU Dashboard"},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
+    }
+
+    try:
+        data = json.dumps(payload).encode()
+        req = URLRequest(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: urlopen(req, context=ctx, timeout=15))
+        status = resp.status
+        return {"ok": status in (200, 201, 202), "detail": f"HTTP {status}"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:200]}
+
+
+def evaluate_alerts_from_data(data, server_name):
+    """Evaluate alert_configs against server data. Returns list of triggered alerts."""
+    if not data or data.get("status") == "offline":
+        return []
+    triggered = []
+    gpus = data.get("gpus", [])
+    for g in gpus:
+        temp = g.get("temp", 0) or 0
+        util = g.get("gpu_util", 0)
+        mem_pct = g["mem_used"] / max(g["mem_total"], 1) * 100
+        pow_pct = g["power_draw"] / max(g["power_limit"], 1) * 100
+
+        checks = [
+            ("gpu_temp_warning", temp, ">=", f"GPU {g['index']} temp: {temp}°C"),
+            ("gpu_temp_critical", temp, ">=", f"GPU {g['index']} temp: {temp}°C"),
+            ("gpu_util_low", util, "<=", f"GPU {g['index']} util: {util}%"),
+            ("vram_high", mem_pct, ">=", f"GPU {g['index']} VRAM: {mem_pct:.0f}%"),
+            ("power_high", pow_pct, ">=", f"GPU {g['index']} power: {pow_pct:.0f}%"),
+        ]
+        for rule_id, value, op, detail in checks:
+            cfg = alert_configs.get(rule_id)
+            if not cfg or not cfg["enabled"]:
+                continue
+            tripped = (value >= cfg["threshold"]) if op == ">=" else (value <= cfg["threshold"])
+            if tripped:
+                triggered.append({
+                    "rule": rule_id,
+                    "severity": cfg["severity"],
+                    "title": f"{cfg['name']} on {server_name}",
+                    "detail": detail,
+                    "server": server_name,
+                    "gpu": g["index"],
+                    "value": round(value, 1),
+                    "threshold": cfg["threshold"],
+                })
+    return triggered
+
+
+async def alert_monitor_loop():
+    """Background loop: evaluate alerts every 60s, send emails for new/changed alerts."""
+    await asyncio.sleep(10)  # wait for app to warm up
+    while True:
+        try:
+            if email_config["enabled"] and email_config["recipients"] and SENDGRID_API_KEY:
+                now = time.time()
+                cooldown_sec = email_config["cooldown_minutes"] * 60
+                all_triggered = []
+
+                for sk in SERVERS:
+                    try:
+                        data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=15)
+                    except Exception:
+                        data = None
+                    alerts = evaluate_alerts_from_data(data, SERVERS[sk]["name"])
+                    all_triggered.extend(alerts)
+
+                # Filter by cooldown
+                to_send = []
+                for a in all_triggered:
+                    key = f"{a['rule']}_{a['server']}_{a['gpu']}"
+                    last = email_cooldowns.get(key, 0)
+                    if now - last >= cooldown_sec:
+                        to_send.append(a)
+                        email_cooldowns[key] = now
+
+                if to_send:
+                    # Group: only send critical+warning
+                    critical = [a for a in to_send if a["severity"] in ("critical", "warning")]
+                    if critical:
+                        subject = f"[GPU Alert] {len(critical)} alert(s) — {critical[0]['title']}"
+                        result = await send_alert_email(email_config["recipients"], subject, critical)
+                        email_history.appendleft({
+                            "t": now,
+                            "to": email_config["recipients"][:],
+                            "subject": subject,
+                            "alerts_count": len(critical),
+                            "status": "sent" if result["ok"] else "failed",
+                            "detail": result["detail"],
+                        })
+        except Exception as e:
+            email_history.appendleft({
+                "t": time.time(),
+                "to": [],
+                "subject": "Monitor error",
+                "alerts_count": 0,
+                "status": "error",
+                "detail": str(e)[:200],
+            })
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def start_alert_monitor():
+    asyncio.create_task(alert_monitor_loop())
+
+
+@app.get("/api/email-config")
+async def get_email_config():
+    """Get email alert configuration and history."""
+    return {
+        "enabled": email_config["enabled"],
+        "recipients": email_config["recipients"],
+        "cooldown_minutes": email_config["cooldown_minutes"],
+        "sendgrid_configured": bool(SENDGRID_API_KEY),
+        "mail_from": SENDGRID_MAIL_FROM,
+        "history": list(email_history),
+    }
+
+
+@app.post("/api/email-config")
+async def update_email_config(request: Request):
+    """Update email alert configuration."""
+    body = await request.json()
+    if "enabled" in body:
+        email_config["enabled"] = bool(body["enabled"])
+    if "recipients" in body:
+        email_config["recipients"] = [r.strip() for r in body["recipients"] if r.strip()]
+    if "cooldown_minutes" in body:
+        email_config["cooldown_minutes"] = max(1, min(120, int(body["cooldown_minutes"])))
+    if "add_recipient" in body:
+        r = body["add_recipient"].strip()
+        if r and r not in email_config["recipients"]:
+            email_config["recipients"].append(r)
+    if "remove_recipient" in body:
+        r = body["remove_recipient"].strip()
+        if r in email_config["recipients"]:
+            email_config["recipients"].remove(r)
+    return {"ok": True, **email_config}
+
+
+@app.post("/api/email-test")
+async def send_test_email(request: Request):
+    """Send a test alert email."""
+    body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
+    recipients = body.get("recipients", email_config["recipients"])
+    test_alerts = [{
+        "severity": "info",
+        "title": "Test Alert",
+        "detail": "This is a test email from GPU Admin Dashboard. If you received this, email alerts are working correctly.",
+    }]
+    result = await send_alert_email(recipients, "[GPU Dashboard] Test Alert", test_alerts)
+    email_history.appendleft({
+        "t": time.time(),
+        "to": recipients[:],
+        "subject": "[GPU Dashboard] Test Alert",
+        "alerts_count": 1,
+        "status": "sent" if result["ok"] else "failed",
+        "detail": result["detail"],
+    })
+    return result
 
 
 @app.get("/api/executive")
@@ -5128,26 +5370,109 @@ function renderIncidents() {
 }
 
 // ── Alerts Config Tab ──
+let emailConfigData = null;
 async function loadAlertsConfig() {
-  try { const r = await fetch('/api/alerts-config'); alertsconfigData = await r.json(); renderAlertsConfig(); } catch(e) { console.error(e); }
+  try {
+    const [r1, r2] = await Promise.all([fetch('/api/alerts-config'), fetch('/api/email-config')]);
+    alertsconfigData = await r1.json();
+    emailConfigData = await r2.json();
+    renderAlertsConfig();
+  } catch(e) { console.error(e); }
 }
 async function updateAlertThreshold(ruleId, field, value) {
   try {
-    await fetch('/api/alerts-config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({rule_id: ruleId, [field]: value})
-    });
+    await fetch('/api/alerts-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({rule_id: ruleId, [field]: value}) });
     loadAlertsConfig();
   } catch(e) { console.error(e); }
+}
+async function updateEmailConfig(payload) {
+  try {
+    await fetch('/api/email-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    loadAlertsConfig();
+  } catch(e) { console.error(e); }
+}
+async function addEmailRecipient() {
+  const input = document.getElementById('new-email-input');
+  const email = input.value.trim();
+  if (email && email.includes('@')) { await updateEmailConfig({add_recipient: email}); input.value = ''; }
+}
+async function sendTestEmail() {
+  const btn = document.getElementById('test-email-btn');
+  btn.textContent = 'Sending...'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/email-test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    const result = await r.json();
+    btn.textContent = result.ok ? 'Sent!' : 'Failed';
+    setTimeout(() => { btn.textContent = 'Send Test Email'; btn.disabled = false; }, 3000);
+    loadAlertsConfig();
+  } catch(e) { btn.textContent = 'Error'; setTimeout(() => { btn.textContent = 'Send Test Email'; btn.disabled = false; }, 3000); }
 }
 function renderAlertsConfig() {
   const el = document.getElementById('page-alertsconfig');
   if (!alertsconfigData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
   const d = alertsconfigData;
+  const ec = emailConfigData || {};
 
-  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Alert Configuration</h3>';
-  html += '<p class="text-xs text-gray-500 mb-4">Customize alert thresholds — changes take effect immediately</p>';
+  // Email Notifications Section
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Email Notifications</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">SendGrid-powered alerts sent when thresholds are breached</p>';
+
+  html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">';
+  // Left: Settings
+  html += '<div class="glass-bright rounded-lg p-4">';
+  html += '<div class="flex items-center justify-between mb-3">';
+  html += `<span class="text-sm text-white font-medium">Email Alerts</span>`;
+  html += `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${ec.enabled?'checked':''} onchange="updateEmailConfig({enabled:this.checked})" class="accent-emerald-500" /><span class="text-xs ${ec.enabled?'text-emerald-400':'text-gray-500'}">${ec.enabled?'Enabled':'Disabled'}</span></label>`;
+  html += '</div>';
+  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'}</div>`;
+  html += '<div class="flex items-center gap-2 mb-3">';
+  html += '<span class="text-xs text-gray-400">Cooldown:</span>';
+  html += `<input type="number" value="${ec.cooldown_minutes||30}" min="1" max="120" onchange="updateEmailConfig({cooldown_minutes:parseInt(this.value)})" class="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs text-right" />`;
+  html += '<span class="text-[10px] text-gray-500">min between repeat alerts</span>';
+  html += '</div>';
+  html += `<button id="test-email-btn" onclick="sendTestEmail()" class="w-full py-2 px-3 rounded-lg text-xs font-medium ${ec.sendgrid_configured&&ec.recipients?.length?'bg-cyan-600 hover:bg-cyan-500 text-white':'bg-gray-700 text-gray-400 cursor-not-allowed'}" ${ec.sendgrid_configured&&ec.recipients?.length?'':'disabled'}>Send Test Email</button>`;
+  html += '</div>';
+
+  // Right: Recipients
+  html += '<div class="glass-bright rounded-lg p-4">';
+  html += '<div class="text-sm text-white font-medium mb-2">Recipients</div>';
+  html += '<div class="space-y-1 mb-3">';
+  for (const r of (ec.recipients||[])) {
+    html += `<div class="flex items-center justify-between bg-gray-800/50 rounded px-3 py-1.5">`;
+    html += `<span class="text-xs text-gray-300">${r}</span>`;
+    html += `<button onclick="updateEmailConfig({remove_recipient:'${r}'})" class="text-red-400 hover:text-red-300 text-xs px-1">✕</button>`;
+    html += '</div>';
+  }
+  if (!(ec.recipients||[]).length) html += '<div class="text-[10px] text-gray-500">No recipients configured</div>';
+  html += '</div>';
+  html += '<div class="flex gap-2">';
+  html += '<input id="new-email-input" type="email" placeholder="email@example.com" class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-white text-xs" onkeydown="if(event.key===\'Enter\')addEmailRecipient()" />';
+  html += '<button onclick="addEmailRecipient()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded">Add</button>';
+  html += '</div>';
+  html += '</div>';
+  html += '</div>';
+
+  // Email History
+  const hist = ec.history || [];
+  if (hist.length > 0) {
+    html += '<div class="text-xs text-gray-400 font-medium mb-2">Notification History</div>';
+    html += '<div class="space-y-1 max-h-40 overflow-y-auto">';
+    for (const h of hist.slice(0, 20)) {
+      const time = new Date(h.t * 1000).toLocaleString();
+      const statusC = h.status === 'sent' ? 'text-emerald-400' : h.status === 'failed' ? 'text-red-400' : 'text-amber-400';
+      html += `<div class="flex items-center justify-between text-[10px] py-1 px-2 rounded bg-white/[0.02]">`;
+      html += `<span class="text-gray-500">${time}</span>`;
+      html += `<span class="text-gray-400 flex-1 mx-2 truncate">${h.subject||''}</span>`;
+      html += `<span class="${statusC} font-medium">${h.status}</span>`;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Alert Rules Section
+  html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Alert Rules</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Customize thresholds — changes take effect immediately</p>';
   html += `<div class="text-xs text-gray-400 mb-4">${d.active_count||0} active alert(s) right now</div>`;
 
   html += '<div class="space-y-3">';

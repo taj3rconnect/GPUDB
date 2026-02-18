@@ -1869,26 +1869,105 @@ function renderIncidents() {
 }
 
 // ── Alerts Config Tab ──
+let emailConfigData = null;
 async function loadAlertsConfig() {
-  try { const r = await fetch('/api/gpu?endpoint=alerts-config'); alertsconfigData = await r.json(); renderAlertsConfig(); } catch(e) { console.error(e); }
+  try {
+    const [r1, r2] = await Promise.all([fetch('/api/gpu?endpoint=alerts-config'), fetch('/api/gpu?endpoint=email-config')]);
+    alertsconfigData = await r1.json();
+    emailConfigData = await r2.json();
+    renderAlertsConfig();
+  } catch(e) { console.error(e); }
 }
 async function updateAlertThreshold(ruleId, field, value) {
   try {
-    await fetch('/api/gpu?endpoint=alerts-config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({rule_id: ruleId, [field]: value})
-    });
+    await fetch('/api/gpu?endpoint=alerts-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({rule_id: ruleId, [field]: value}) });
     loadAlertsConfig();
   } catch(e) { console.error(e); }
+}
+async function updateEmailConfig(payload) {
+  try {
+    await fetch('/api/gpu?endpoint=email-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    loadAlertsConfig();
+  } catch(e) { console.error(e); }
+}
+async function addEmailRecipient() {
+  const input = document.getElementById('new-email-input');
+  const email = input.value.trim();
+  if (email && email.includes('@')) { await updateEmailConfig({add_recipient: email}); input.value = ''; }
+}
+async function sendTestEmail() {
+  const btn = document.getElementById('test-email-btn');
+  btn.textContent = 'Sending...'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/gpu?endpoint=email-test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    const result = await r.json();
+    btn.textContent = result.ok ? 'Sent!' : 'Failed';
+    setTimeout(() => { btn.textContent = 'Send Test Email'; btn.disabled = false; }, 3000);
+    loadAlertsConfig();
+  } catch(e) { btn.textContent = 'Error'; setTimeout(() => { btn.textContent = 'Send Test Email'; btn.disabled = false; }, 3000); }
 }
 function renderAlertsConfig() {
   const el = document.getElementById('page-alertsconfig');
   if (!alertsconfigData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
   const d = alertsconfigData;
+  const ec = emailConfigData || {};
 
-  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Alert Configuration</h3>';
-  html += '<p class="text-xs text-gray-500 mb-4">Customize alert thresholds — changes take effect immediately</p>';
+  // Email Notifications Section
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Email Notifications</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">SendGrid-powered alerts sent when thresholds are breached</p>';
+
+  html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">';
+  html += '<div class="glass-bright rounded-lg p-4">';
+  html += '<div class="flex items-center justify-between mb-3">';
+  html += `<span class="text-sm text-white font-medium">Email Alerts</span>`;
+  html += `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${ec.enabled?'checked':''} onchange="updateEmailConfig({enabled:this.checked})" class="accent-emerald-500" /><span class="text-xs ${ec.enabled?'text-emerald-400':'text-gray-500'}">${ec.enabled?'Enabled':'Disabled'}</span></label>`;
+  html += '</div>';
+  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'}</div>`;
+  html += '<div class="flex items-center gap-2 mb-3">';
+  html += '<span class="text-xs text-gray-400">Cooldown:</span>';
+  html += `<input type="number" value="${ec.cooldown_minutes||30}" min="1" max="120" onchange="updateEmailConfig({cooldown_minutes:parseInt(this.value)})" class="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs text-right" />`;
+  html += '<span class="text-[10px] text-gray-500">min between repeat alerts</span>';
+  html += '</div>';
+  html += `<button id="test-email-btn" onclick="sendTestEmail()" class="w-full py-2 px-3 rounded-lg text-xs font-medium ${ec.sendgrid_configured&&ec.recipients?.length?'bg-cyan-600 hover:bg-cyan-500 text-white':'bg-gray-700 text-gray-400 cursor-not-allowed'}" ${ec.sendgrid_configured&&ec.recipients?.length?'':'disabled'}>Send Test Email</button>`;
+  html += '</div>';
+
+  html += '<div class="glass-bright rounded-lg p-4">';
+  html += '<div class="text-sm text-white font-medium mb-2">Recipients</div>';
+  html += '<div class="space-y-1 mb-3">';
+  for (const r of (ec.recipients||[])) {
+    html += `<div class="flex items-center justify-between bg-gray-800/50 rounded px-3 py-1.5">`;
+    html += `<span class="text-xs text-gray-300">${r}</span>`;
+    html += `<button onclick="updateEmailConfig({remove_recipient:'${r}'})" class="text-red-400 hover:text-red-300 text-xs px-1">✕</button>`;
+    html += '</div>';
+  }
+  if (!(ec.recipients||[]).length) html += '<div class="text-[10px] text-gray-500">No recipients configured</div>';
+  html += '</div>';
+  html += '<div class="flex gap-2">';
+  html += '<input id="new-email-input" type="email" placeholder="email@example.com" class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-white text-xs" onkeydown="if(event.key===\'Enter\')addEmailRecipient()" />';
+  html += '<button onclick="addEmailRecipient()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded">Add</button>';
+  html += '</div>';
+  html += '</div>';
+  html += '</div>';
+
+  const hist = ec.history || [];
+  if (hist.length > 0) {
+    html += '<div class="text-xs text-gray-400 font-medium mb-2">Notification History</div>';
+    html += '<div class="space-y-1 max-h-40 overflow-y-auto">';
+    for (const h of hist.slice(0, 20)) {
+      const time = new Date(h.t * 1000).toLocaleString();
+      const statusC = h.status === 'sent' ? 'text-emerald-400' : h.status === 'failed' ? 'text-red-400' : 'text-amber-400';
+      html += `<div class="flex items-center justify-between text-[10px] py-1 px-2 rounded bg-white/[0.02]">`;
+      html += `<span class="text-gray-500">${time}</span>`;
+      html += `<span class="text-gray-400 flex-1 mx-2 truncate">${h.subject||''}</span>`;
+      html += `<span class="${statusC} font-medium">${h.status}</span>`;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Alert Rules</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Customize thresholds — changes take effect immediately</p>';
   html += `<div class="text-xs text-gray-400 mb-4">${d.active_count||0} active alert(s) right now</div>`;
 
   html += '<div class="space-y-3">';

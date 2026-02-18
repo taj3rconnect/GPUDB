@@ -41,6 +41,10 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/alerts-config"
         elif endpoint == "sla":
             upstream = f"{H200_API}/api/sla"
+        elif endpoint == "email-config":
+            upstream = f"{H200_API}/api/email-config"
+        elif endpoint == "email-test":
+            upstream = f"{H200_API}/api/email-test"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
@@ -77,7 +81,7 @@ class handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         endpoint = params.get("endpoint", [""])[0]
 
-        post_endpoints = {"alerts-config": "/api/alerts-config", "sla": "/api/sla"}
+        post_endpoints = {"alerts-config": "/api/alerts-config", "sla": "/api/sla", "email-config": "/api/email-config", "email-test": "/api/email-test"}
         if endpoint not in post_endpoints:
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

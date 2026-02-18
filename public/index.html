@@ -73,6 +73,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
 </div>
 
 <!-- Content -->
@@ -86,6 +87,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-analytics" class="hidden"></div>
   <div id="page-proactive" class="hidden"></div>
   <div id="page-capacity" class="hidden"></div>
+  <div id="page-quality" class="hidden"></div>
 </div>
 
 <script>
@@ -106,6 +108,7 @@ let analyticsData = null;
 let analyticsLoaded = false;
 let proactiveData = null;
 let capacityData = null;
+let qualityData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -142,7 +145,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -153,6 +156,7 @@ function switchTab(tab) {
   if (tab === 'analytics') loadAnalytics();
   if (tab === 'proactive') loadProactive();
   if (tab === 'capacity') loadCapacity();
+  if (tab === 'quality') loadQuality();
 }
 
 // ── Overview Tab ──
@@ -1570,6 +1574,154 @@ function renderAll() {
   else if (activeTab === 'analytics') renderAnalytics();
   else if (activeTab === 'proactive') renderProactive();
   else if (activeTab === 'capacity') renderCapacity();
+  else if (activeTab === 'quality') renderQuality();
+}
+
+// ── Call Quality Deep Dive Tab ──
+async function loadQuality() {
+  try {
+    const r = await fetch('/api/gpu?endpoint=quality');
+    qualityData = await r.json();
+    renderQuality();
+  } catch(e) { console.error('Quality load error:', e); }
+}
+
+function renderQuality() {
+  const el = document.getElementById('page-quality');
+  if (!qualityData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading quality data...</div>'; return; }
+  const d = qualityData;
+
+  // ── 1. Pipeline Waterfall ──
+  let wfHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Pipeline Waterfall</h3>';
+  wfHTML += '<p class="text-xs text-gray-500 mb-4">Call lifecycle breakdown: Queue → TTFT → Generation</p>';
+  if ((d.waterfall||[]).length === 0) {
+    wfHTML += '<div class="text-gray-500 text-sm">No waterfall data yet (needs vLLM metrics).</div>';
+  } else {
+    wfHTML += '<div class="space-y-1">';
+    for (const w of d.waterfall.slice(-30)) {
+      const time = new Date(w.t * 1000).toLocaleTimeString();
+      const maxW = Math.max(w.total_s, 0.001);
+      const qW = w.queue_s / maxW * 100;
+      const tW = w.ttft_s / maxW * 100;
+      const gW = w.generation_s / maxW * 100;
+      wfHTML += `<div class="flex items-center gap-2 text-[10px]">`;
+      wfHTML += `<span class="text-gray-500 w-16 flex-shrink-0">${time}</span>`;
+      wfHTML += `<span class="text-gray-400 w-8 text-right">${w.calls}c</span>`;
+      wfHTML += `<div class="flex-1 flex h-4 rounded overflow-hidden bg-gray-800">`;
+      if (qW > 0.5) wfHTML += `<div style="width:${qW}%" class="bg-amber-500/60" title="Queue: ${w.queue_s.toFixed(3)}s"></div>`;
+      if (tW > 0.5) wfHTML += `<div style="width:${tW}%" class="bg-cyan-500/60" title="TTFT: ${w.ttft_s.toFixed(3)}s"></div>`;
+      if (gW > 0.5) wfHTML += `<div style="width:${gW}%" class="bg-purple-500/60" title="Gen: ${w.generation_s.toFixed(3)}s"></div>`;
+      wfHTML += `</div>`;
+      wfHTML += `<span class="text-gray-400 w-12 text-right">${w.total_s.toFixed(2)}s</span>`;
+      wfHTML += `</div>`;
+    }
+    wfHTML += '</div>';
+    wfHTML += '<div class="flex gap-4 mt-3 text-[10px]">';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-amber-500/60"></span> Queue</span>';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-cyan-500/60"></span> TTFT</span>';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-purple-500/60"></span> Generation</span>';
+    wfHTML += '</div>';
+  }
+  wfHTML += '</div>';
+
+  // ── 2. Quality Degradation Heatmap ──
+  let hmHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Quality Degradation Map</h3>';
+  hmHTML += '<p class="text-xs text-gray-500 mb-4">TTFT by hour and GPU utilization — shows where quality drops</p>';
+  const dmap = d.degradation_map || [];
+  if (dmap.length === 0) {
+    hmHTML += '<div class="text-gray-500 text-sm">No degradation data yet.</div>';
+  } else {
+    const hours = [...new Set(dmap.map(d=>d.hour))].sort((a,b)=>a-b);
+    const buckets = [...new Set(dmap.map(d=>d.util_bucket))].sort((a,b)=>a-b);
+    const lookup = {};
+    let maxTtft = 1;
+    for (const cell of dmap) {
+      lookup[cell.hour+'_'+cell.util_bucket] = cell;
+      if (cell.avg_ttft_ms > maxTtft) maxTtft = cell.avg_ttft_ms;
+    }
+    hmHTML += '<div class="overflow-x-auto"><table class="text-[10px]">';
+    hmHTML += '<thead><tr><th class="px-1 py-1 text-gray-500">Util \\ Hour</th>';
+    for (const h of hours) hmHTML += `<th class="px-1 py-1 text-gray-500 text-center">${String(h).padStart(2,'0')}</th>`;
+    hmHTML += '</tr></thead><tbody>';
+    for (const b of buckets) {
+      hmHTML += `<tr><td class="px-1 py-1 text-gray-400 font-medium">${b}-${b+9}%</td>`;
+      for (const h of hours) {
+        const cell = lookup[h+'_'+b];
+        if (cell && cell.avg_ttft_ms > 0) {
+          const intensity = Math.min(cell.avg_ttft_ms / Math.max(maxTtft, 1), 1);
+          const r = Math.round(intensity * 239);
+          const g = Math.round((1-intensity) * 197);
+          hmHTML += `<td class="px-1 py-1 text-center rounded" style="background:rgba(${r},${g},50,0.3)" title="${cell.avg_ttft_ms}ms TTFT, ${cell.samples} samples">${cell.avg_ttft_ms.toFixed(0)}</td>`;
+        } else {
+          hmHTML += '<td class="px-1 py-1 text-center text-gray-700">-</td>';
+        }
+      }
+      hmHTML += '</tr>';
+    }
+    hmHTML += '</tbody></table></div>';
+    hmHTML += '<div class="flex items-center gap-2 mt-2 text-[10px] text-gray-500"><span>Low TTFT</span><div class="w-24 h-2 rounded" style="background:linear-gradient(to right, rgba(50,197,50,0.3), rgba(239,50,50,0.3))"></div><span>High TTFT</span></div>';
+  }
+  hmHTML += '</div>';
+
+  // ── 3. Latency Curve ──
+  let lcHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Concurrent Calls vs Latency</h3>';
+  lcHTML += '<p class="text-xs text-gray-500 mb-4">Find the inflection point where quality degrades</p>';
+  const curve = d.latency_curve || [];
+  if (curve.length === 0) {
+    lcHTML += '<div class="text-gray-500 text-sm">No latency curve data yet.</div>';
+  } else {
+    const maxE2E = Math.max(...curve.map(c=>c.avg_e2e_s), 0.001);
+    lcHTML += '<div class="space-y-1">';
+    for (const c of curve) {
+      const barW = (c.avg_e2e_s / maxE2E * 100);
+      const inflClass = c.inflection ? 'border-l-2 border-red-400 pl-2' : '';
+      const barColor = c.avg_e2e_s > 6 ? 'bg-red-500/60' : c.avg_e2e_s > 3 ? 'bg-amber-500/60' : 'bg-emerald-500/60';
+      lcHTML += `<div class="flex items-center gap-2 text-[11px] ${inflClass}">`;
+      lcHTML += `<span class="text-gray-400 w-16 text-right">${c.concurrent_calls} calls</span>`;
+      lcHTML += `<div class="flex-1 h-5 rounded bg-gray-800 relative overflow-hidden">`;
+      lcHTML += `<div class="${barColor} h-full rounded" style="width:${barW}%"></div>`;
+      lcHTML += `<span class="absolute inset-y-0 left-2 flex items-center text-white text-[10px]">${c.avg_e2e_s.toFixed(2)}s e2e &middot; ${c.avg_ttft_ms.toFixed(0)}ms ttft &middot; KV:${c.avg_kv_cache}%</span>`;
+      lcHTML += `</div>`;
+      lcHTML += `<span class="text-gray-500 w-12 text-right text-[10px]">${c.samples}s</span>`;
+      if (c.inflection) lcHTML += '<span class="text-red-400 text-[10px] font-bold">INFLECTION</span>';
+      lcHTML += '</div>';
+    }
+    lcHTML += '</div>';
+  }
+  lcHTML += '</div>';
+
+  // ── 4. SLA Compliance ──
+  let slaHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">SLA Compliance Tracker</h3>';
+  slaHTML += '<p class="text-xs text-gray-500 mb-4">Track compliance against quality targets</p>';
+  const sla = d.sla_compliance || {};
+  if (Object.keys(sla).length === 0) {
+    slaHTML += '<div class="text-gray-500 text-sm">No SLA data yet.</div>';
+  } else {
+    slaHTML += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const [metric, s] of Object.entries(sla)) {
+      const compC = s.compliance_pct >= 99 ? 'text-emerald-400' : s.compliance_pct >= 95 ? 'text-amber-400' : 'text-red-400';
+      slaHTML += `<div class="glass-bright rounded-lg p-4">`;
+      slaHTML += `<div class="flex justify-between items-center mb-2">`;
+      slaHTML += `<span class="text-xs text-white font-medium">${s.label}</span>`;
+      slaHTML += `<span class="text-lg font-bold ${compC}">${s.compliance_pct}%</span>`;
+      slaHTML += '</div>';
+      slaHTML += `<div class="h-2 rounded-full bg-gray-800 mb-2"><div class="h-2 rounded-full" style="width:${Math.min(s.compliance_pct,100)}%;background:${s.compliance_pct >= 99 ? '#22c55e' : s.compliance_pct >= 95 ? '#f59e0b' : '#ef4444'}"></div></div>`;
+      slaHTML += `<div class="flex justify-between text-[10px] text-gray-500 mb-2">`;
+      slaHTML += `<span>${s.total_samples} samples</span>`;
+      slaHTML += `<span class="${s.violations > 0 ? 'text-red-400' : 'text-gray-500'}">${s.violations} violations</span>`;
+      slaHTML += '</div>';
+      if ((s.worst_hours||[]).length > 0) {
+        slaHTML += '<div class="text-[10px] text-gray-500">Worst hours: ';
+        slaHTML += s.worst_hours.map(h => `<span class="text-red-400">${h.hour}</span> (${h.violations})`).join(', ');
+        slaHTML += '</div>';
+      }
+      slaHTML += '</div>';
+    }
+    slaHTML += '</div>';
+  }
+  slaHTML += '</div>';
+
+  el.innerHTML = wfHTML + hmHTML + lcHTML + slaHTML;
 }
 
 // ── Data Fetching ──

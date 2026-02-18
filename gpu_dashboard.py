@@ -641,6 +641,153 @@ async def get_agent_status():
         return {"error": str(e), "status": "offline"}
 
 
+@app.get("/api/quality")
+async def get_quality():
+    """Call Quality Deep Dive — waterfall, degradation heatmap, latency curve, SLA compliance."""
+    result = {
+        "waterfall": [],
+        "degradation_map": [],
+        "latency_curve": [],
+        "sla_compliance": {},
+    }
+
+    # SLA targets
+    SLA = {
+        "ttft_ms": {"target": 300, "label": "TTFT < 300ms"},
+        "itl_ms": {"target": 60, "label": "ITL < 60ms"},
+        "e2e_s": {"target": 3.0, "label": "E2E < 3s"},
+        "queue_s": {"target": 0.5, "label": "Queue < 500ms"},
+    }
+
+    all_points = []
+    for sk in SERVERS:
+        for p in list(history[sk]):
+            if p.get("ttft_ms", 0) > 0 or p.get("e2e_s", 0) > 0:
+                all_points.append({**p, "server": sk})
+
+    # ── 1. Per-Call Waterfall (pipeline breakdown over time) ──
+    recent_h200 = [p for p in list(history.get("h200", []))[-120:] if p.get("e2e_s", 0) > 0]
+    for p in recent_h200[-60:]:
+        ttft_s = p.get("ttft_ms", 0) / 1000
+        e2e = p.get("e2e_s", 0)
+        queue = p.get("queue_s", 0)
+        generation = max(0, e2e - ttft_s)
+        total = queue + e2e
+        result["waterfall"].append({
+            "t": p["t"],
+            "queue_s": round(queue, 4),
+            "ttft_s": round(ttft_s, 4),
+            "generation_s": round(generation, 4),
+            "total_s": round(total, 4),
+            "calls": p.get("calls", 0),
+            "queue_pct": round(queue / max(total, 0.001) * 100, 1),
+            "ttft_pct": round(ttft_s / max(total, 0.001) * 100, 1),
+            "gen_pct": round(generation / max(total, 0.001) * 100, 1),
+        })
+
+    # ── 2. Quality Degradation Map (heatmap: hour x utilization bucket) ──
+    from datetime import datetime, timezone
+    heatmap = {}
+    for p in all_points:
+        dt = datetime.fromtimestamp(p["t"], tz=timezone.utc)
+        hour = dt.hour
+        util = p.get("avg_util", 0)
+        util_bucket = int(util // 10) * 10
+        key = f"{hour}_{util_bucket}"
+        if key not in heatmap:
+            heatmap[key] = {"ttft": [], "e2e": [], "itl": []}
+        if p.get("ttft_ms", 0) > 0:
+            heatmap[key]["ttft"].append(p["ttft_ms"])
+        if p.get("e2e_s", 0) > 0:
+            heatmap[key]["e2e"].append(p["e2e_s"])
+        if p.get("itl_ms", 0) > 0:
+            heatmap[key]["itl"].append(p["itl_ms"])
+
+    for key, vals in heatmap.items():
+        hour, util_bucket = key.split("_")
+        result["degradation_map"].append({
+            "hour": int(hour),
+            "util_bucket": int(util_bucket),
+            "avg_ttft_ms": round(sum(vals["ttft"]) / len(vals["ttft"]), 1) if vals["ttft"] else 0,
+            "avg_e2e_s": round(sum(vals["e2e"]) / len(vals["e2e"]), 3) if vals["e2e"] else 0,
+            "avg_itl_ms": round(sum(vals["itl"]) / len(vals["itl"]), 1) if vals["itl"] else 0,
+            "samples": len(vals["ttft"]) + len(vals["e2e"]),
+        })
+    result["degradation_map"].sort(key=lambda x: (x["hour"], x["util_bucket"]))
+
+    # ── 3. Concurrent Call vs Latency Curve ──
+    call_groups = {}
+    for p in all_points:
+        c = p.get("calls", 0)
+        if c not in call_groups:
+            call_groups[c] = {"ttft": [], "itl": [], "e2e": [], "queue": [], "kv": []}
+        if p.get("ttft_ms", 0) > 0:
+            call_groups[c]["ttft"].append(p["ttft_ms"])
+        if p.get("itl_ms", 0) > 0:
+            call_groups[c]["itl"].append(p["itl_ms"])
+        if p.get("e2e_s", 0) > 0:
+            call_groups[c]["e2e"].append(p["e2e_s"])
+        if p.get("queue_s", 0) > 0:
+            call_groups[c]["queue"].append(p["queue_s"])
+        if p.get("kv_cache", 0) > 0:
+            call_groups[c]["kv"].append(p["kv_cache"])
+
+    prev_e2e = 0
+    for c in sorted(call_groups.keys()):
+        g = call_groups[c]
+        avg_e2e = sum(g["e2e"]) / len(g["e2e"]) if g["e2e"] else 0
+        avg_ttft = sum(g["ttft"]) / len(g["ttft"]) if g["ttft"] else 0
+        is_inflection = prev_e2e > 0 and avg_e2e > prev_e2e * 1.5
+        result["latency_curve"].append({
+            "concurrent_calls": c,
+            "avg_ttft_ms": round(avg_ttft, 1),
+            "avg_itl_ms": round(sum(g["itl"]) / len(g["itl"]), 1) if g["itl"] else 0,
+            "avg_e2e_s": round(avg_e2e, 3),
+            "avg_queue_s": round(sum(g["queue"]) / len(g["queue"]), 4) if g["queue"] else 0,
+            "avg_kv_cache": round(sum(g["kv"]) / len(g["kv"]), 1) if g["kv"] else 0,
+            "samples": len(g["ttft"]) + len(g["e2e"]),
+            "inflection": is_inflection,
+        })
+        if avg_e2e > 0:
+            prev_e2e = avg_e2e
+
+    # ── 4. SLA Compliance Tracker ──
+    for metric, sla in SLA.items():
+        values = []
+        violations = []
+        for p in all_points:
+            v = p.get(metric, 0)
+            if v <= 0:
+                continue
+            values.append(v)
+            if v > sla["target"]:
+                violations.append({"t": p["t"], "value": round(v, 2), "server": p.get("server", "")})
+
+        total = len(values)
+        violated = len(violations)
+        compliance = round((total - violated) / max(total, 1) * 100, 2)
+
+        hourly_violations = {}
+        for viol in violations:
+            dt = datetime.fromtimestamp(viol["t"], tz=timezone.utc)
+            h = dt.strftime("%H:00")
+            hourly_violations[h] = hourly_violations.get(h, 0) + 1
+
+        worst_hours = sorted(hourly_violations.items(), key=lambda x: -x[1])[:5]
+
+        result["sla_compliance"][metric] = {
+            "label": sla["label"],
+            "target": sla["target"],
+            "total_samples": total,
+            "violations": violated,
+            "compliance_pct": compliance,
+            "worst_hours": [{"hour": h, "violations": c} for h, c in worst_hours],
+            "recent_violations": violations[-10:],
+        }
+
+    return result
+
+
 @app.get("/api/capacity")
 async def get_capacity():
     """Capacity Planner — What-If simulator, ROI, scale recommendations, cloud comparison."""
@@ -1898,6 +2045,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
 </div>
 
 <!-- Content -->
@@ -1911,6 +2059,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-analytics" class="hidden"></div>
   <div id="page-proactive" class="hidden"></div>
   <div id="page-capacity" class="hidden"></div>
+  <div id="page-quality" class="hidden"></div>
 </div>
 
 <script>
@@ -1931,6 +2080,7 @@ let analyticsData = null;
 let analyticsLoaded = false;
 let proactiveData = null;
 let capacityData = null;
+let qualityData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -1967,7 +2117,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -1978,6 +2128,7 @@ function switchTab(tab) {
   if (tab === 'analytics') loadAnalytics();
   if (tab === 'proactive') loadProactive();
   if (tab === 'capacity') loadCapacity();
+  if (tab === 'quality') loadQuality();
 }
 
 // ── Overview Tab ──
@@ -3647,6 +3798,154 @@ function renderAll() {
   else if (activeTab === 'analytics') renderAnalytics();
   else if (activeTab === 'proactive') renderProactive();
   else if (activeTab === 'capacity') renderCapacity();
+  else if (activeTab === 'quality') renderQuality();
+}
+
+// ── Call Quality Deep Dive Tab ──
+async function loadQuality() {
+  try {
+    const r = await fetch('/api/quality');
+    qualityData = await r.json();
+    renderQuality();
+  } catch(e) { console.error('Quality load error:', e); }
+}
+
+function renderQuality() {
+  const el = document.getElementById('page-quality');
+  if (!qualityData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading quality data...</div>'; return; }
+  const d = qualityData;
+
+  // ── 1. Pipeline Waterfall ──
+  let wfHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Pipeline Waterfall</h3>';
+  wfHTML += '<p class="text-xs text-gray-500 mb-4">Call lifecycle breakdown: Queue → TTFT → Generation</p>';
+  if ((d.waterfall||[]).length === 0) {
+    wfHTML += '<div class="text-gray-500 text-sm">No waterfall data yet (needs vLLM metrics).</div>';
+  } else {
+    wfHTML += '<div class="space-y-1">';
+    for (const w of d.waterfall.slice(-30)) {
+      const time = new Date(w.t * 1000).toLocaleTimeString();
+      const maxW = Math.max(w.total_s, 0.001);
+      const qW = w.queue_s / maxW * 100;
+      const tW = w.ttft_s / maxW * 100;
+      const gW = w.generation_s / maxW * 100;
+      wfHTML += `<div class="flex items-center gap-2 text-[10px]">`;
+      wfHTML += `<span class="text-gray-500 w-16 flex-shrink-0">${time}</span>`;
+      wfHTML += `<span class="text-gray-400 w-8 text-right">${w.calls}c</span>`;
+      wfHTML += `<div class="flex-1 flex h-4 rounded overflow-hidden bg-gray-800">`;
+      if (qW > 0.5) wfHTML += `<div style="width:${qW}%" class="bg-amber-500/60" title="Queue: ${w.queue_s.toFixed(3)}s"></div>`;
+      if (tW > 0.5) wfHTML += `<div style="width:${tW}%" class="bg-cyan-500/60" title="TTFT: ${w.ttft_s.toFixed(3)}s"></div>`;
+      if (gW > 0.5) wfHTML += `<div style="width:${gW}%" class="bg-purple-500/60" title="Gen: ${w.generation_s.toFixed(3)}s"></div>`;
+      wfHTML += `</div>`;
+      wfHTML += `<span class="text-gray-400 w-12 text-right">${w.total_s.toFixed(2)}s</span>`;
+      wfHTML += `</div>`;
+    }
+    wfHTML += '</div>';
+    wfHTML += '<div class="flex gap-4 mt-3 text-[10px]">';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-amber-500/60"></span> Queue</span>';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-cyan-500/60"></span> TTFT</span>';
+    wfHTML += '<span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-purple-500/60"></span> Generation</span>';
+    wfHTML += '</div>';
+  }
+  wfHTML += '</div>';
+
+  // ── 2. Quality Degradation Heatmap ──
+  let hmHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Quality Degradation Map</h3>';
+  hmHTML += '<p class="text-xs text-gray-500 mb-4">TTFT by hour and GPU utilization — shows where quality drops</p>';
+  const dmap = d.degradation_map || [];
+  if (dmap.length === 0) {
+    hmHTML += '<div class="text-gray-500 text-sm">No degradation data yet.</div>';
+  } else {
+    const hours = [...new Set(dmap.map(d=>d.hour))].sort((a,b)=>a-b);
+    const buckets = [...new Set(dmap.map(d=>d.util_bucket))].sort((a,b)=>a-b);
+    const lookup = {};
+    let maxTtft = 1;
+    for (const cell of dmap) {
+      lookup[cell.hour+'_'+cell.util_bucket] = cell;
+      if (cell.avg_ttft_ms > maxTtft) maxTtft = cell.avg_ttft_ms;
+    }
+    hmHTML += '<div class="overflow-x-auto"><table class="text-[10px]">';
+    hmHTML += '<thead><tr><th class="px-1 py-1 text-gray-500">Util \\ Hour</th>';
+    for (const h of hours) hmHTML += `<th class="px-1 py-1 text-gray-500 text-center">${String(h).padStart(2,'0')}</th>`;
+    hmHTML += '</tr></thead><tbody>';
+    for (const b of buckets) {
+      hmHTML += `<tr><td class="px-1 py-1 text-gray-400 font-medium">${b}-${b+9}%</td>`;
+      for (const h of hours) {
+        const cell = lookup[h+'_'+b];
+        if (cell && cell.avg_ttft_ms > 0) {
+          const intensity = Math.min(cell.avg_ttft_ms / Math.max(maxTtft, 1), 1);
+          const r = Math.round(intensity * 239);
+          const g = Math.round((1-intensity) * 197);
+          hmHTML += `<td class="px-1 py-1 text-center rounded" style="background:rgba(${r},${g},50,0.3)" title="${cell.avg_ttft_ms}ms TTFT, ${cell.samples} samples">${cell.avg_ttft_ms.toFixed(0)}</td>`;
+        } else {
+          hmHTML += '<td class="px-1 py-1 text-center text-gray-700">-</td>';
+        }
+      }
+      hmHTML += '</tr>';
+    }
+    hmHTML += '</tbody></table></div>';
+    hmHTML += '<div class="flex items-center gap-2 mt-2 text-[10px] text-gray-500"><span>Low TTFT</span><div class="w-24 h-2 rounded" style="background:linear-gradient(to right, rgba(50,197,50,0.3), rgba(239,50,50,0.3))"></div><span>High TTFT</span></div>';
+  }
+  hmHTML += '</div>';
+
+  // ── 3. Latency Curve ──
+  let lcHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Concurrent Calls vs Latency</h3>';
+  lcHTML += '<p class="text-xs text-gray-500 mb-4">Find the inflection point where quality degrades</p>';
+  const curve = d.latency_curve || [];
+  if (curve.length === 0) {
+    lcHTML += '<div class="text-gray-500 text-sm">No latency curve data yet.</div>';
+  } else {
+    const maxE2E = Math.max(...curve.map(c=>c.avg_e2e_s), 0.001);
+    lcHTML += '<div class="space-y-1">';
+    for (const c of curve) {
+      const barW = (c.avg_e2e_s / maxE2E * 100);
+      const inflClass = c.inflection ? 'border-l-2 border-red-400 pl-2' : '';
+      const barColor = c.avg_e2e_s > 6 ? 'bg-red-500/60' : c.avg_e2e_s > 3 ? 'bg-amber-500/60' : 'bg-emerald-500/60';
+      lcHTML += `<div class="flex items-center gap-2 text-[11px] ${inflClass}">`;
+      lcHTML += `<span class="text-gray-400 w-16 text-right">${c.concurrent_calls} calls</span>`;
+      lcHTML += `<div class="flex-1 h-5 rounded bg-gray-800 relative overflow-hidden">`;
+      lcHTML += `<div class="${barColor} h-full rounded" style="width:${barW}%"></div>`;
+      lcHTML += `<span class="absolute inset-y-0 left-2 flex items-center text-white text-[10px]">${c.avg_e2e_s.toFixed(2)}s e2e &middot; ${c.avg_ttft_ms.toFixed(0)}ms ttft &middot; KV:${c.avg_kv_cache}%</span>`;
+      lcHTML += `</div>`;
+      lcHTML += `<span class="text-gray-500 w-12 text-right text-[10px]">${c.samples}s</span>`;
+      if (c.inflection) lcHTML += '<span class="text-red-400 text-[10px] font-bold">INFLECTION</span>';
+      lcHTML += '</div>';
+    }
+    lcHTML += '</div>';
+  }
+  lcHTML += '</div>';
+
+  // ── 4. SLA Compliance ──
+  let slaHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">SLA Compliance Tracker</h3>';
+  slaHTML += '<p class="text-xs text-gray-500 mb-4">Track compliance against quality targets</p>';
+  const sla = d.sla_compliance || {};
+  if (Object.keys(sla).length === 0) {
+    slaHTML += '<div class="text-gray-500 text-sm">No SLA data yet.</div>';
+  } else {
+    slaHTML += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const [metric, s] of Object.entries(sla)) {
+      const compC = s.compliance_pct >= 99 ? 'text-emerald-400' : s.compliance_pct >= 95 ? 'text-amber-400' : 'text-red-400';
+      slaHTML += `<div class="glass-bright rounded-lg p-4">`;
+      slaHTML += `<div class="flex justify-between items-center mb-2">`;
+      slaHTML += `<span class="text-xs text-white font-medium">${s.label}</span>`;
+      slaHTML += `<span class="text-lg font-bold ${compC}">${s.compliance_pct}%</span>`;
+      slaHTML += '</div>';
+      slaHTML += `<div class="h-2 rounded-full bg-gray-800 mb-2"><div class="h-2 rounded-full" style="width:${Math.min(s.compliance_pct,100)}%;background:${s.compliance_pct >= 99 ? '#22c55e' : s.compliance_pct >= 95 ? '#f59e0b' : '#ef4444'}"></div></div>`;
+      slaHTML += `<div class="flex justify-between text-[10px] text-gray-500 mb-2">`;
+      slaHTML += `<span>${s.total_samples} samples</span>`;
+      slaHTML += `<span class="${s.violations > 0 ? 'text-red-400' : 'text-gray-500'}">${s.violations} violations</span>`;
+      slaHTML += '</div>';
+      if ((s.worst_hours||[]).length > 0) {
+        slaHTML += '<div class="text-[10px] text-gray-500">Worst hours: ';
+        slaHTML += s.worst_hours.map(h => `<span class="text-red-400">${h.hour}</span> (${h.violations})`).join(', ');
+        slaHTML += '</div>';
+      }
+      slaHTML += '</div>';
+    }
+    slaHTML += '</div>';
+  }
+  slaHTML += '</div>';
+
+  el.innerHTML = wfHTML + hmHTML + lcHTML + slaHTML;
 }
 
 // ── Data Fetching ──

@@ -102,6 +102,9 @@ email_config = {
 email_cooldowns = {}  # {alert_key: last_sent_timestamp}
 email_history = deque(maxlen=100)  # {t, to, subject, alerts_count, status, detail}
 
+# ── Daily Report Store ───────────────────────────────────────
+last_report = {"html": "", "generated_at": None, "sent_at": None, "status": "none"}
+
 
 # ── Data Persistence ──────────────────────────────────────────
 PERSIST_FILE = Path(__file__).parent / "gpu_dashboard_state.json"
@@ -1760,15 +1763,243 @@ async def alert_monitor_loop():
         await asyncio.sleep(60)
 
 
+async def generate_daily_report():
+    """Generate a 24h summary report as styled HTML (letter-size, portrait, 1-2 pages)."""
+    from datetime import datetime, timezone, timedelta
+    est = timezone(timedelta(hours=-5))
+    now_est = datetime.now(est)
+    report_date = now_est.strftime("%B %d, %Y")
+    report_time = now_est.strftime("%I:%M %p EST")
+    cutoff = time.time() - 86400  # 24h ago
+
+    # Gather data for each server
+    server_summaries = []
+    all_alerts = []
+    for sk in SERVERS:
+        try:
+            data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=15)
+        except Exception:
+            data = None
+        sname = SERVERS[sk]["name"]
+
+        if data and data.get("status") != "offline":
+            gpus = data.get("gpus", [])
+            avg_util = sum(g.get("utilization", 0) for g in gpus) / max(len(gpus), 1)
+            max_temp = max((g.get("temperature", 0) for g in gpus), default=0)
+            avg_temp = sum(g.get("temperature", 0) for g in gpus) / max(len(gpus), 1)
+            total_power = sum(g.get("power_draw", 0) for g in gpus)
+            vram_used = sum(g.get("memory_used", 0) for g in gpus)
+            vram_total = sum(g.get("memory_total", 0) for g in gpus)
+            vram_pct = (vram_used / vram_total * 100) if vram_total else 0
+            gpu_count = len(gpus)
+            ecc_errors = sum(g.get("ecc_errors", 0) for g in gpus)
+
+            # Peak values from history
+            peak_util, peak_temp, peak_power = 0, 0, 0
+            for h in history.get(sk, []):
+                if h.get("t", 0) < cutoff:
+                    continue
+                for g in h.get("gpus", []):
+                    peak_util = max(peak_util, g.get("utilization", 0))
+                    peak_temp = max(peak_temp, g.get("temperature", 0))
+                    peak_power = max(peak_power, g.get("power_draw", 0))
+
+            server_summaries.append({
+                "name": sname, "status": "Online", "gpu_count": gpu_count,
+                "avg_util": avg_util, "peak_util": peak_util,
+                "avg_temp": avg_temp, "max_temp": max_temp, "peak_temp": peak_temp,
+                "total_power": total_power, "peak_power": peak_power,
+                "vram_pct": vram_pct, "vram_used": vram_used, "vram_total": vram_total,
+                "ecc_errors": ecc_errors, "uptime": data.get("uptime", 0),
+            })
+        else:
+            server_summaries.append({"name": sname, "status": "Offline"})
+            all_alerts.append({"severity": "critical", "title": f"{sname} — Offline/Unreachable"})
+
+        alerts = evaluate_alerts_from_data(data, sname)
+        all_alerts.extend(alerts)
+
+    # Count alerts by severity
+    crit_count = sum(1 for a in all_alerts if a.get("severity") == "critical")
+    warn_count = sum(1 for a in all_alerts if a.get("severity") == "warning")
+
+    # Email history in last 24h
+    emails_24h = [e for e in email_history if e.get("t", 0) >= cutoff]
+
+    # Build HTML
+    def bar(pct, color="#22c55e"):
+        if pct > 80: color = "#ef4444"
+        elif pct > 60: color = "#f59e0b"
+        return f'<div style="width:100%;height:8px;background:#1f2937;border-radius:4px"><div style="width:{min(pct,100):.0f}%;height:8px;background:{color};border-radius:4px"></div></div>'
+
+    server_cards = ""
+    for s in server_summaries:
+        if s["status"] == "Offline":
+            server_cards += f'''<div style="background:#1a1a2e;border:1px solid #ef4444;border-radius:8px;padding:16px;margin-bottom:12px">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:#fff;font-weight:600">{s["name"]}</span>
+                    <span style="color:#ef4444;font-weight:bold">OFFLINE</span>
+                </div></div>'''
+            continue
+        server_cards += f'''<div style="background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:16px;margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <span style="color:#fff;font-weight:600;font-size:14px">{s["name"]}</span>
+                <span style="color:#22c55e;font-size:12px">● Online · {s["gpu_count"]} GPUs · Up {s["uptime"]//86400}d {(s["uptime"]%86400)//3600}h</span>
+            </div>
+            <table style="width:100%;border-collapse:collapse;font-size:12px">
+                <tr><td style="color:#9ca3af;padding:4px 0">GPU Utilization</td><td style="color:#fff;text-align:right;padding:4px 0">Avg {s["avg_util"]:.0f}% · Peak {s["peak_util"]:.0f}%</td></tr>
+                <tr><td colspan="2" style="padding:2px 0 8px">{bar(s["avg_util"])}</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 0">Temperature</td><td style="color:#fff;text-align:right;padding:4px 0">Avg {s["avg_temp"]:.0f}°C · Peak {s["peak_temp"]:.0f}°C</td></tr>
+                <tr><td colspan="2" style="padding:2px 0 8px">{bar(s["avg_temp"], "#f59e0b" if s["peak_temp"]>75 else "#22c55e")}</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 0">VRAM Usage</td><td style="color:#fff;text-align:right;padding:4px 0">{s["vram_pct"]:.0f}% ({s["vram_used"]//1024:.0f}/{s["vram_total"]//1024:.0f} GiB)</td></tr>
+                <tr><td colspan="2" style="padding:2px 0 8px">{bar(s["vram_pct"])}</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 0">Power Draw</td><td style="color:#fff;text-align:right;padding:4px 0">{s["total_power"]:.0f}W · Peak {s["peak_power"]:.0f}W</td></tr>
+                {f'<tr><td style="color:#9ca3af;padding:4px 0">ECC Errors</td><td style="color:#ef4444;text-align:right;padding:4px 0;font-weight:bold">{s["ecc_errors"]}</td></tr>' if s["ecc_errors"] else ''}
+            </table>
+        </div>'''
+
+    alert_rows = ""
+    for a in all_alerts[:15]:
+        sev = a.get("severity", "info")
+        sc = "#ef4444" if sev == "critical" else "#f59e0b" if sev == "warning" else "#3b82f6"
+        alert_rows += f'<tr><td style="padding:6px 8px;color:{sc};font-weight:bold;font-size:11px;border-bottom:1px solid #1f2937">{sev.upper()}</td><td style="padding:6px 8px;color:#e5e7eb;font-size:11px;border-bottom:1px solid #1f2937">{a.get("title","")}</td></tr>'
+    if not alert_rows:
+        alert_rows = '<tr><td colspan="2" style="padding:12px;color:#6b7280;text-align:center;font-size:12px">No alerts in the last 24 hours</td></tr>'
+
+    email_rows = ""
+    for e in emails_24h[:10]:
+        ts = time.strftime("%I:%M %p", time.localtime(e["t"]))
+        email_rows += f'<tr><td style="padding:4px 8px;color:#9ca3af;font-size:11px;border-bottom:1px solid #1f2937">{ts}</td><td style="padding:4px 8px;color:#e5e7eb;font-size:11px;border-bottom:1px solid #1f2937">{e.get("subject","")[:60]}</td><td style="padding:4px 8px;color:{"#22c55e" if e.get("status")=="sent" else "#ef4444"};font-size:11px;border-bottom:1px solid #1f2937">{e.get("status","")}</td></tr>'
+
+    health_color = "#22c55e" if crit_count == 0 and warn_count <= 2 else "#f59e0b" if crit_count == 0 else "#ef4444"
+    health_text = "Healthy" if crit_count == 0 and warn_count <= 2 else "Warning" if crit_count == 0 else "Critical"
+
+    html = f"""<div style="background:#0a0a0f;padding:24px;font-family:'Inter','Segoe UI',Arial,sans-serif;color:#e5e7eb;max-width:680px;margin:0 auto">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+        <div style="width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#10b981,#06b6d4);display:flex;align-items:center;justify-content:center"><span style="color:#fff;font-size:20px">📊</span></div>
+        <div><h1 style="margin:0;color:#fff;font-size:20px">GPU Fleet Daily Report</h1><p style="margin:0;color:#6b7280;font-size:12px">{report_date} · Generated at {report_time}</p></div>
+    </div>
+
+    <div style="display:flex;gap:12px;margin:16px 0">
+        <div style="flex:1;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:14px;text-align:center">
+            <div style="color:#6b7280;font-size:10px;text-transform:uppercase;margin-bottom:4px">Fleet Health</div>
+            <div style="color:{health_color};font-size:20px;font-weight:700">{health_text}</div>
+        </div>
+        <div style="flex:1;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:14px;text-align:center">
+            <div style="color:#6b7280;font-size:10px;text-transform:uppercase;margin-bottom:4px">Servers</div>
+            <div style="color:#fff;font-size:20px;font-weight:700">{len(server_summaries)}</div>
+        </div>
+        <div style="flex:1;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:14px;text-align:center">
+            <div style="color:#6b7280;font-size:10px;text-transform:uppercase;margin-bottom:4px">Critical</div>
+            <div style="color:{'#ef4444' if crit_count else '#22c55e'};font-size:20px;font-weight:700">{crit_count}</div>
+        </div>
+        <div style="flex:1;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:14px;text-align:center">
+            <div style="color:#6b7280;font-size:10px;text-transform:uppercase;margin-bottom:4px">Warnings</div>
+            <div style="color:{'#f59e0b' if warn_count else '#22c55e'};font-size:20px;font-weight:700">{warn_count}</div>
+        </div>
+    </div>
+
+    <h2 style="color:#fff;font-size:14px;margin:20px 0 10px;border-bottom:1px solid #2d2d44;padding-bottom:6px">Server Status</h2>
+    {server_cards}
+
+    <h2 style="color:#fff;font-size:14px;margin:20px 0 10px;border-bottom:1px solid #2d2d44;padding-bottom:6px">Active Alerts ({len(all_alerts)})</h2>
+    <table style="width:100%;border-collapse:collapse;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px">
+        {alert_rows}
+    </table>
+
+    {'<h2 style="color:#fff;font-size:14px;margin:20px 0 10px;border-bottom:1px solid #2d2d44;padding-bottom:6px">Email Notifications Sent (' + str(len(emails_24h)) + ')</h2><table style="width:100%;border-collapse:collapse;background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px"><tr style="border-bottom:1px solid #333"><th style="padding:6px 8px;text-align:left;color:#6b7280;font-size:10px">TIME</th><th style="padding:6px 8px;text-align:left;color:#6b7280;font-size:10px">SUBJECT</th><th style="padding:6px 8px;text-align:left;color:#6b7280;font-size:10px">STATUS</th></tr>' + email_rows + '</table>' if emails_24h else ''}
+
+    <div style="margin-top:20px;padding-top:12px;border-top:1px solid #2d2d44;color:#4b5563;font-size:10px;text-align:center">
+        GPU Admin Dashboard · Auto-generated daily report · {report_date}
+    </div>
+</div>"""
+
+    last_report["html"] = html
+    last_report["generated_at"] = time.time()
+    return html
+
+
+async def send_daily_report():
+    """Generate and email the daily report."""
+    html = await generate_daily_report()
+    if not SENDGRID_API_KEY or not email_config["recipients"]:
+        last_report["status"] = "no_config"
+        return
+    from datetime import datetime, timezone, timedelta
+    est = timezone(timedelta(hours=-5))
+    date_str = datetime.now(est).strftime("%b %d, %Y")
+    subject = f"[GPU Dashboard] Daily Report — {date_str}"
+    payload = {
+        "personalizations": [{"to": [{"email": r} for r in email_config["recipients"]]}],
+        "from": {"email": SENDGRID_MAIL_FROM, "name": "GPU Dashboard"},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
+    }
+    try:
+        data = json.dumps(payload).encode()
+        req = URLRequest(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=data,
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: urlopen(req, context=ctx, timeout=15))
+        last_report["sent_at"] = time.time()
+        last_report["status"] = "sent" if resp.status in (200, 201, 202) else f"http_{resp.status}"
+    except Exception as e:
+        last_report["status"] = f"error: {str(e)[:100]}"
+
+
+async def daily_report_loop():
+    """Background loop: send report at midnight EST every day."""
+    from datetime import datetime, timezone, timedelta
+    est = timezone(timedelta(hours=-5))
+    await asyncio.sleep(30)
+    while True:
+        now_est = datetime.now(est)
+        # Calculate seconds until next midnight EST
+        tomorrow = now_est.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        wait_sec = (tomorrow - now_est).total_seconds()
+        await asyncio.sleep(wait_sec)
+        try:
+            await send_daily_report()
+        except Exception:
+            pass
+
+
 @app.on_event("startup")
 async def start_background_tasks():
     asyncio.create_task(alert_monitor_loop())
     asyncio.create_task(persist_loop())
+    asyncio.create_task(daily_report_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_save():
     save_state()
+
+
+@app.get("/api/report")
+async def get_report():
+    """Get the last generated report or generate a new one."""
+    return {
+        "html": last_report["html"],
+        "generated_at": last_report["generated_at"],
+        "sent_at": last_report["sent_at"],
+        "status": last_report["status"],
+    }
+
+
+@app.post("/api/report")
+async def generate_report_now(request: Request):
+    """Generate a report now and optionally email it."""
+    body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
+    html = await generate_daily_report()
+    if body.get("send_email"):
+        await send_daily_report()
+        return {"ok": True, "status": last_report["status"], "generated_at": last_report["generated_at"]}
+    return {"ok": True, "generated_at": last_report["generated_at"]}
 
 
 @app.get("/api/email-config")
@@ -3717,7 +3948,10 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
         <span id="nightModeLabel" style="display:none;color:#f59e0b;margin-left:6px" title="Auto hourly refresh 10PM-8AM EST">🌙 Night</span>
       </div>
       <div id="lastUpdate" class="text-xs text-gray-500"></div>
-      <button onclick="openServerSettings()" title="Server Settings" class="ml-2 p-1.5 rounded-lg hover:bg-gray-700 transition-colors text-gray-400 hover:text-white">
+      <button onclick="openReport()" title="Daily Report" class="ml-2 p-1.5 rounded-lg hover:bg-gray-700 transition-colors text-gray-400 hover:text-white">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+      </button>
+      <button onclick="openServerSettings()" title="Server Settings" class="ml-1 p-1.5 rounded-lg hover:bg-gray-700 transition-colors text-gray-400 hover:text-white">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
       </button>
     </div>
@@ -3754,6 +3988,22 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
         <button onclick="document.getElementById('addServerForm').style.display='none'" class="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm">Cancel</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Report Modal -->
+<div id="reportModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px)" onclick="if(event.target===this)closeReport()">
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:750px;max-width:95vw;max-height:90vh;overflow-y:auto;background:#1e1e2e;border:1px solid #333;border-radius:12px;padding:24px">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-white">Daily Report</h2>
+      <div class="flex items-center gap-2">
+        <span id="reportMeta" class="text-xs text-gray-500"></span>
+        <button onclick="generateReport(false)" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs">Refresh</button>
+        <button onclick="generateReport(true)" class="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs">Email Now</button>
+        <button onclick="closeReport()" class="text-gray-400 hover:text-white text-xl ml-2">&times;</button>
+      </div>
+    </div>
+    <div id="reportContent" style="background:#0a0a0f;border-radius:8px;overflow:hidden"></div>
   </div>
 </div>
 
@@ -6680,6 +6930,38 @@ function updateRefreshRate(val) {
   refreshRate = val || parseInt(document.getElementById('refreshRate').value);
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = setInterval(refresh, refreshRate);
+}
+
+// ── Daily Report ──
+async function openReport() {
+  document.getElementById('reportModal').style.display = 'block';
+  document.getElementById('reportContent').innerHTML = '<div style="padding:40px;text-align:center;color:#6b7280">Loading report...</div>';
+  try {
+    const r = await fetch('/api/report');
+    const data = await r.json();
+    if (data.html) {
+      document.getElementById('reportContent').innerHTML = data.html;
+      const gen = data.generated_at ? new Date(data.generated_at * 1000).toLocaleString() : 'Never';
+      const sent = data.sent_at ? new Date(data.sent_at * 1000).toLocaleString() : 'Never';
+      document.getElementById('reportMeta').textContent = `Generated: ${gen} · Sent: ${sent}`;
+    } else {
+      document.getElementById('reportContent').innerHTML = '<div style="padding:40px;text-align:center;color:#6b7280">No report generated yet. Click "Refresh" to generate one.</div>';
+    }
+  } catch(e) { document.getElementById('reportContent').innerHTML = '<div style="padding:40px;text-align:center;color:#ef4444">Failed to load report</div>'; }
+}
+
+function closeReport() { document.getElementById('reportModal').style.display = 'none'; }
+
+async function generateReport(sendEmail) {
+  document.getElementById('reportContent').innerHTML = '<div style="padding:40px;text-align:center;color:#6b7280">Generating report...</div>';
+  try {
+    const r = await fetch('/api/report', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({send_email:sendEmail})});
+    const res = await r.json();
+    if (sendEmail && res.ok) {
+      document.getElementById('reportMeta').textContent = 'Report emailed!';
+    }
+    await openReport();
+  } catch(e) { document.getElementById('reportContent').innerHTML = '<div style="padding:40px;text-align:center;color:#ef4444">Failed to generate report</div>'; }
 }
 
 // ── Server Settings ──

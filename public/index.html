@@ -27,6 +27,8 @@
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
   canvas { image-rendering: pixelated; }
   .tab-active { border-bottom: 2px solid #22c55e; color: #fff; }
+  .tab-dot { position: relative; }
+  .tab-dot::after { content: ''; position: absolute; top: 0; right: -6px; width: 7px; height: 7px; background: #ef4444; border-radius: 50%; animation: pulse-red 2s infinite; }
   .tab-inactive { border-bottom: 2px solid transparent; color: #6b7280; }
   .tab-inactive:hover { color: #9ca3af; }
   .kpi-card { transition: all 0.2s ease; }
@@ -169,8 +171,44 @@ function sparklineSVG(data, width, height, color) {
   return `<svg width="${width}" height="${height}" class="sparkline"><path d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
+// ── Red Dot Alert System ──
+let tabAlerts = {};
+function setTabDot(tab, on) {
+  const el = document.getElementById('tab-' + tab);
+  if (!el) return;
+  if (on) { el.classList.add('tab-dot'); tabAlerts[tab] = true; }
+  else { el.classList.remove('tab-dot'); delete tabAlerts[tab]; }
+}
+function clearTabDot(tab) { setTabDot(tab, false); }
+function updateTabDots() {
+  let overviewCrit = false;
+  for (const k of SERVERS) {
+    const d = serverData[k];
+    if (!d) continue;
+    if (d.status === 'offline') { overviewCrit = true; break; }
+    for (const g of (d.gpus||[])) {
+      if ((g.temp||0) > 85 || g.gpu_util > 95) { overviewCrit = true; break; }
+      const mp = g.mem_total > 0 ? g.mem_used / g.mem_total * 100 : 0;
+      if (mp > 95) { overviewCrit = true; break; }
+    }
+  }
+  if (overviewCrit && activeTab !== 'overview') setTabDot('overview', true);
+  if (proactiveData) {
+    const pa = proactiveData.predictive_alerts || [];
+    if (pa.some(a => a.severity === 'critical') && activeTab !== 'proactive') setTabDot('proactive', true);
+  }
+  if (alertsconfigData) {
+    const active = alertsconfigData.active_alerts || [];
+    if (active.some(a => { const cfg = (alertsconfigData.configs||{})[a.rule] || {}; return cfg.severity === 'critical'; }) && activeTab !== 'alertsconfig') setTabDot('alertsconfig', true);
+  }
+  if (incidentsData && (incidentsData.summary||{}).critical_count > 0 && activeTab !== 'incidents') setTabDot('incidents', true);
+  if (anomaliesData && (anomaliesData.summary||{}).critical > 0 && activeTab !== 'anomalies') setTabDot('anomalies', true);
+  if (slaData && ((slaData.overall||{}).grade === 'D' || (slaData.overall||{}).grade === 'F') && activeTab !== 'sla') setTabDot('sla', true);
+}
+
 // ── Tab Switching ──
 function switchTab(tab) {
+  clearTabDot(tab);
   activeTab = tab;
   ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power','incidents','alertsconfig','sla','anomalies'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
@@ -1927,7 +1965,7 @@ function renderAlertsConfig() {
   html += `<span class="text-sm text-white font-medium">Email Alerts</span>`;
   html += `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${ec.enabled?'checked':''} onchange="updateEmailConfig({enabled:this.checked})" class="accent-emerald-500" /><span class="text-xs ${ec.enabled?'text-emerald-400':'text-gray-500'}">${ec.enabled?'Enabled':'Disabled'}</span></label>`;
   html += '</div>';
-  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'}</div>`;
+  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'} · Quiet: ${ec.quiet_hours||'8PM-8AM EST'} ${ec.in_quiet_hours?'<span class="text-amber-400">(active now)</span>':''}</div>`;
   html += '<div class="flex items-center gap-2 mb-3">';
   html += '<span class="text-xs text-gray-400">Cooldown:</span>';
   html += `<input type="number" value="${ec.cooldown_minutes||30}" min="1" max="120" onchange="updateEmailConfig({cooldown_minutes:parseInt(this.value)})" class="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs text-right" />`;
@@ -2623,6 +2661,7 @@ async function refresh() {
   refresh._histCount++;
 
   renderAll();
+  updateTabDots();
   document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }
 

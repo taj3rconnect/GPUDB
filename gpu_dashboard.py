@@ -54,7 +54,7 @@ SERVERS = {
 SSH_KEY = str(Path.home() / ".ssh" / "id_ed25519")
 
 # ── History Store (in-memory, per server) ──────────────────────
-MAX_HISTORY = 1440  # 24hrs at 1-min intervals, or ~72min at 3s
+MAX_HISTORY = 2880  # 48hrs at 1-min intervals
 history = {k: deque(maxlen=MAX_HISTORY) for k in SERVERS}
 
 # Hourly aggregation: {server: {hour_key: {max_calls, max_util, calls_at_max_util, samples}}}
@@ -73,7 +73,7 @@ fetch_errors = deque(maxlen=200)
 # Inter-cluster latency tracking: deque of {t, rtt_ms}
 cluster_latency = deque(maxlen=MAX_HISTORY)
 # Disk usage tracking: {server: deque of {t, used_bytes, total_bytes, pct}}
-disk_history = {k: deque(maxlen=480) for k in SERVERS}  # ~24h at 3min intervals
+disk_history = {k: deque(maxlen=960) for k in SERVERS}  # ~48h at 3min intervals
 # GPU clock tracking for throttle detection: {server: {gpu_idx: deque of {t, sm_clock, temp}}}
 gpu_clock_history = {k: {} for k in SERVERS}
 # Call volume by hour-of-day for forecasting: {dow_hour: [call_counts]}
@@ -101,6 +101,160 @@ email_config = {
 }
 email_cooldowns = {}  # {alert_key: last_sent_timestamp}
 email_history = deque(maxlen=100)  # {t, to, subject, alerts_count, status, detail}
+
+
+# ── Data Persistence ──────────────────────────────────────────
+PERSIST_FILE = Path(__file__).parent / "gpu_dashboard_state.json"
+PERSIST_INTERVAL = 300  # save every 5 minutes
+
+def _deque_to_list(d):
+    """Convert deque to list for JSON serialization."""
+    return list(d)
+
+def _nested_deque_to_dict(d):
+    """Convert {key: deque} to {key: list}."""
+    return {k: list(v) for k, v in d.items()}
+
+def _clock_history_to_dict(ch):
+    """Convert {server: {gpu_idx: deque}} to serializable dict."""
+    result = {}
+    for sk, gpus in ch.items():
+        result[sk] = {str(idx): list(dq) for idx, dq in gpus.items()}
+    return result
+
+def _service_uptime_to_dict(su):
+    """Convert service_uptime with incident deques to serializable dict."""
+    result = {}
+    for name, data in su.items():
+        entry = {k: v for k, v in data.items() if k != "incidents"}
+        entry["incidents"] = list(data.get("incidents", []))
+        result[name] = entry
+    return result
+
+def save_state():
+    """Save all in-memory stores to JSON file."""
+    try:
+        state = {
+            "saved_at": time.time(),
+            "history": _nested_deque_to_dict(history),
+            "hourly_stats": {k: v for k, v in hourly_stats.items()},
+            "error_history": _nested_deque_to_dict(error_history),
+            "process_health_history": _deque_to_list(process_health_history),
+            "service_uptime": _service_uptime_to_dict(service_uptime),
+            "fetch_errors": _deque_to_list(fetch_errors),
+            "cluster_latency": _deque_to_list(cluster_latency),
+            "disk_history": _nested_deque_to_dict(disk_history),
+            "gpu_clock_history": _clock_history_to_dict(gpu_clock_history),
+            "call_volume_patterns": call_volume_patterns,
+            "email_config": email_config,
+            "email_cooldowns": email_cooldowns,
+            "email_history": _deque_to_list(email_history),
+            "alert_configs": alert_configs,
+        }
+        # Write to temp file first, then rename (atomic on Linux)
+        tmp = PERSIST_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")))
+        tmp.rename(PERSIST_FILE)
+    except Exception as e:
+        print(f"[persist] save error: {e}")
+
+def load_state():
+    """Load persisted state from JSON file on startup."""
+    global call_volume_patterns, email_config, email_cooldowns
+    if not PERSIST_FILE.exists():
+        print("[persist] no state file found, starting fresh")
+        return
+    try:
+        state = json.loads(PERSIST_FILE.read_text())
+        age = time.time() - state.get("saved_at", 0)
+        print(f"[persist] loading state (saved {age:.0f}s ago)")
+
+        # Restore history deques
+        for sk in SERVERS:
+            if sk in state.get("history", {}):
+                for item in state["history"][sk]:
+                    history[sk].append(item)
+
+        # Restore hourly_stats
+        for sk in SERVERS:
+            if sk in state.get("hourly_stats", {}):
+                hourly_stats[sk] = state["hourly_stats"][sk]
+
+        # Restore error_history
+        for sk in SERVERS:
+            if sk in state.get("error_history", {}):
+                for item in state["error_history"][sk]:
+                    error_history[sk].append(item)
+
+        # Restore process_health_history
+        for item in state.get("process_health_history", []):
+            process_health_history.append(item)
+
+        # Restore service_uptime
+        for name, data in state.get("service_uptime", {}).items():
+            incidents = deque(maxlen=50)
+            for inc in data.get("incidents", []):
+                incidents.append(inc)
+            service_uptime[name] = {k: v for k, v in data.items() if k != "incidents"}
+            service_uptime[name]["incidents"] = incidents
+
+        # Restore fetch_errors
+        for item in state.get("fetch_errors", []):
+            fetch_errors.append(item)
+
+        # Restore cluster_latency
+        for item in state.get("cluster_latency", []):
+            cluster_latency.append(item)
+
+        # Restore disk_history
+        for sk in SERVERS:
+            if sk in state.get("disk_history", {}):
+                for item in state["disk_history"][sk]:
+                    disk_history[sk].append(item)
+
+        # Restore gpu_clock_history
+        for sk in SERVERS:
+            if sk in state.get("gpu_clock_history", {}):
+                for idx_str, items in state["gpu_clock_history"][sk].items():
+                    idx = int(idx_str)
+                    gpu_clock_history[sk][idx] = deque(maxlen=120)
+                    for item in items:
+                        gpu_clock_history[sk][idx].append(item)
+
+        # Restore call_volume_patterns
+        call_volume_patterns.update(state.get("call_volume_patterns", {}))
+
+        # Restore email config
+        saved_email = state.get("email_config", {})
+        if saved_email:
+            email_config.update(saved_email)
+
+        email_cooldowns.update(state.get("email_cooldowns", {}))
+
+        for item in state.get("email_history", []):
+            email_history.append(item)
+
+        # Restore alert configs (merge — keep new keys, update saved thresholds)
+        saved_alerts = state.get("alert_configs", {})
+        for rule_id, cfg in saved_alerts.items():
+            if rule_id in alert_configs:
+                alert_configs[rule_id]["threshold"] = cfg.get("threshold", alert_configs[rule_id]["threshold"])
+                alert_configs[rule_id]["enabled"] = cfg.get("enabled", alert_configs[rule_id]["enabled"])
+
+        h_count = sum(len(v) for v in history.values())
+        print(f"[persist] restored {h_count} history samples, {len(service_uptime)} services, {len(list(email_history))} email logs")
+    except Exception as e:
+        print(f"[persist] load error: {e}")
+
+# Load state on import
+load_state()
+
+
+async def persist_loop():
+    """Background loop: save state every PERSIST_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(PERSIST_INTERVAL)
+        save_state()
 
 
 # ── Command Helpers ────────────────────────────────────────────
@@ -1538,12 +1692,20 @@ def evaluate_alerts_from_data(data, server_name):
     return triggered
 
 
+def _is_quiet_hours():
+    """Check if current time is in quiet hours (8PM-8AM EST). No alerts during this window."""
+    from datetime import datetime, timezone, timedelta
+    est = timezone(timedelta(hours=-5))
+    now_est = datetime.now(est)
+    return now_est.hour >= 20 or now_est.hour < 8
+
+
 async def alert_monitor_loop():
     """Background loop: evaluate alerts every 60s, send emails for new/changed alerts."""
     await asyncio.sleep(10)  # wait for app to warm up
     while True:
         try:
-            if email_config["enabled"] and email_config["recipients"] and SENDGRID_API_KEY:
+            if email_config["enabled"] and email_config["recipients"] and SENDGRID_API_KEY and not _is_quiet_hours():
                 now = time.time()
                 cooldown_sec = email_config["cooldown_minutes"] * 60
                 all_triggered = []
@@ -1592,8 +1754,14 @@ async def alert_monitor_loop():
 
 
 @app.on_event("startup")
-async def start_alert_monitor():
+async def start_background_tasks():
     asyncio.create_task(alert_monitor_loop())
+    asyncio.create_task(persist_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_save():
+    save_state()
 
 
 @app.get("/api/email-config")
@@ -1605,6 +1773,8 @@ async def get_email_config():
         "cooldown_minutes": email_config["cooldown_minutes"],
         "sendgrid_configured": bool(SENDGRID_API_KEY),
         "mail_from": SENDGRID_MAIL_FROM,
+        "quiet_hours": "8PM-8AM EST",
+        "in_quiet_hours": _is_quiet_hours(),
         "history": list(email_history),
     }
 
@@ -3415,6 +3585,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
   canvas { image-rendering: pixelated; }
   .tab-active { border-bottom: 2px solid #22c55e; color: #fff; }
+  .tab-dot { position: relative; }
+  .tab-dot::after { content: ''; position: absolute; top: 0; right: -6px; width: 7px; height: 7px; background: #ef4444; border-radius: 50%; animation: pulse-red 2s infinite; }
   .tab-inactive { border-bottom: 2px solid transparent; color: #6b7280; }
   .tab-inactive:hover { color: #9ca3af; }
   .kpi-card { transition: all 0.2s ease; }
@@ -3557,8 +3729,69 @@ function sparklineSVG(data, width, height, color) {
   return `<svg width="${width}" height="${height}" class="sparkline"><path d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
+// ── Red Dot Alert System ──
+let tabAlerts = {};  // {tabName: true} — tabs with unread critical alerts
+function setTabDot(tab, on) {
+  const el = document.getElementById('tab-' + tab);
+  if (!el) return;
+  if (on) { el.classList.add('tab-dot'); tabAlerts[tab] = true; }
+  else { el.classList.remove('tab-dot'); delete tabAlerts[tab]; }
+}
+function clearTabDot(tab) { setTabDot(tab, false); }
+function updateTabDots() {
+  // Check overview: any server offline or GPU temp > 85
+  let overviewCrit = false;
+  for (const k of SERVERS) {
+    const d = serverData[k];
+    if (!d) continue;
+    if (d.status === 'offline') { overviewCrit = true; break; }
+    for (const g of (d.gpus||[])) {
+      if ((g.temp||0) > 85 || g.gpu_util > 95) { overviewCrit = true; break; }
+      const mp = g.mem_total > 0 ? g.mem_used / g.mem_total * 100 : 0;
+      if (mp > 95) { overviewCrit = true; break; }
+    }
+  }
+  if (overviewCrit && activeTab !== 'overview') setTabDot('overview', true);
+
+  // Check proactive: from last loaded data
+  if (proactiveData) {
+    const pa = proactiveData.predictive_alerts || [];
+    const hasCrit = pa.some(a => a.severity === 'critical');
+    if (hasCrit && activeTab !== 'proactive') setTabDot('proactive', true);
+  }
+
+  // Check alertsconfig: from last loaded data
+  if (alertsconfigData) {
+    const active = alertsconfigData.active_alerts || [];
+    const hasCrit = active.some(a => {
+      const cfg = (alertsconfigData.configs||{})[a.rule] || {};
+      return cfg.severity === 'critical';
+    });
+    if (hasCrit && activeTab !== 'alertsconfig') setTabDot('alertsconfig', true);
+  }
+
+  // Check incidents
+  if (incidentsData) {
+    const crit = (incidentsData.summary||{}).critical_count || 0;
+    if (crit > 0 && activeTab !== 'incidents') setTabDot('incidents', true);
+  }
+
+  // Check anomalies
+  if (anomaliesData) {
+    const crit = (anomaliesData.summary||{}).critical || 0;
+    if (crit > 0 && activeTab !== 'anomalies') setTabDot('anomalies', true);
+  }
+
+  // Check SLA
+  if (slaData) {
+    const grade = (slaData.overall||{}).grade || 'A';
+    if ((grade === 'D' || grade === 'F') && activeTab !== 'sla') setTabDot('sla', true);
+  }
+}
+
 // ── Tab Switching ──
 function switchTab(tab) {
+  clearTabDot(tab);
   activeTab = tab;
   ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power','incidents','alertsconfig','sla','anomalies'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
@@ -5582,7 +5815,7 @@ function renderAlertsConfig() {
   html += `<span class="text-sm text-white font-medium">Email Alerts</span>`;
   html += `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" ${ec.enabled?'checked':''} onchange="updateEmailConfig({enabled:this.checked})" class="accent-emerald-500" /><span class="text-xs ${ec.enabled?'text-emerald-400':'text-gray-500'}">${ec.enabled?'Enabled':'Disabled'}</span></label>`;
   html += '</div>';
-  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'}</div>`;
+  html += `<div class="text-[10px] text-gray-500 mb-2">SendGrid: ${ec.sendgrid_configured?'<span class="text-emerald-400">Configured</span>':'<span class="text-red-400">Not configured</span>'} · From: ${ec.mail_from||'N/A'} · Quiet: ${ec.quiet_hours||'8PM-8AM EST'} ${ec.in_quiet_hours?'<span class="text-amber-400">(active now)</span>':''}</div>`;
   html += '<div class="flex items-center gap-2 mb-3">';
   html += '<span class="text-xs text-gray-400">Cooldown:</span>';
   html += `<input type="number" value="${ec.cooldown_minutes||30}" min="1" max="120" onchange="updateEmailConfig({cooldown_minutes:parseInt(this.value)})" class="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs text-right" />`;
@@ -6304,6 +6537,7 @@ async function refresh() {
   refresh._histCount++;
 
   renderAll();
+  updateTabDots();
   document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }
 

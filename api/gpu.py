@@ -35,6 +35,12 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/modelcompare"
         elif endpoint == "power":
             upstream = f"{H200_API}/api/power"
+        elif endpoint == "incidents":
+            upstream = f"{H200_API}/api/incidents"
+        elif endpoint == "alerts-config":
+            upstream = f"{H200_API}/api/alerts-config"
+        elif endpoint == "sla":
+            upstream = f"{H200_API}/api/sla"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
@@ -65,3 +71,43 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        endpoint = params.get("endpoint", [""])[0]
+
+        post_endpoints = {"alerts-config": "/api/alerts-config", "sla": "/api/sla"}
+        if endpoint not in post_endpoints:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Invalid POST endpoint"}).encode())
+            return
+
+        upstream = f"{H200_API}{post_endpoints[endpoint]}"
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+
+        try:
+            req = Request(upstream, data=body, headers={"User-Agent": "vercel-proxy", "Content-Type": "application/json"}, method="POST")
+            resp = urlopen(req, timeout=20)
+            data = resp.read()
+            self.send_response(200)
+        except Exception as e:
+            data = json.dumps({"error": str(e)}).encode()
+            self.send_response(502)
+
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()

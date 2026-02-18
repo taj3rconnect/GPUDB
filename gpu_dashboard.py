@@ -4,7 +4,7 @@ import time
 import re
 from collections import deque
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -938,6 +938,323 @@ async def get_power():
     }
 
     return result
+
+
+@app.get("/api/incidents")
+async def get_incidents():
+    """Incident Timeline — service restarts, error spikes, latency spikes, temp events."""
+    now = time.time()
+    incidents = []
+
+    # Service restart incidents from service_uptime
+    for name, su in service_uptime.items():
+        for inc in su.get("incidents", []):
+            incidents.append({
+                "t": inc.get("t", now),
+                "type": "restart",
+                "severity": "warning",
+                "title": f"{name} restarted",
+                "detail": f"Service went {inc.get('new_status', 'unknown')}",
+                "source": name,
+            })
+
+    # Error spike incidents from error_history
+    for sk in SERVERS:
+        errs = list(error_history.get(sk, []))
+        for i, e in enumerate(errs):
+            rate = e.get("rate", 0)
+            if rate > 5:
+                severity = "critical" if rate > 20 else "warning"
+                incidents.append({
+                    "t": e["t"],
+                    "type": "error_spike",
+                    "severity": severity,
+                    "title": f"Error spike on {SERVERS[sk]['name']}",
+                    "detail": f"Error rate: {rate:.1f}% ({e.get('errors', 0)} errors / {e.get('total', 0)} total)",
+                    "source": sk,
+                })
+
+    # Temperature events from history
+    for sk in SERVERS:
+        hist = list(history.get(sk, []))
+        for h in hist:
+            gpus = h.get("gpus", [])
+            for g in gpus:
+                temp = g.get("temp", 0) or 0
+                if temp > 80:
+                    incidents.append({
+                        "t": h.get("t", now),
+                        "type": "thermal",
+                        "severity": "critical" if temp > 90 else "warning",
+                        "title": f"GPU {g.get('index', '?')} high temp on {SERVERS[sk]['name']}",
+                        "detail": f"Temperature: {temp}°C",
+                        "source": sk,
+                    })
+
+    # Fetch errors (SSH/network failures)
+    for fe in fetch_errors:
+        incidents.append({
+            "t": fe.get("t", now),
+            "type": "fetch_error",
+            "severity": "warning",
+            "title": f"Connection error to {fe.get('server', '?')}",
+            "detail": str(fe.get("error", ""))[:100],
+            "source": fe.get("server", "unknown"),
+        })
+
+    # Latency spikes from cluster_latency
+    for cl in cluster_latency:
+        rtt = cl.get("rtt_ms", 0)
+        if rtt > 50:
+            incidents.append({
+                "t": cl.get("t", now),
+                "type": "latency_spike",
+                "severity": "critical" if rtt > 200 else "warning",
+                "title": "Cross-cluster latency spike",
+                "detail": f"RTT: {rtt:.0f}ms",
+                "source": "cluster",
+            })
+
+    # Sort by time descending, limit to 200
+    incidents.sort(key=lambda x: x["t"], reverse=True)
+    incidents = incidents[:200]
+
+    # Summary stats
+    last_hour = [i for i in incidents if i["t"] > now - 3600]
+    last_24h = [i for i in incidents if i["t"] > now - 86400]
+
+    return {
+        "incidents": incidents,
+        "summary": {
+            "total": len(incidents),
+            "last_hour": len(last_hour),
+            "last_24h": len(last_24h),
+            "critical_count": len([i for i in incidents if i["severity"] == "critical"]),
+            "warning_count": len([i for i in incidents if i["severity"] == "warning"]),
+            "by_type": {
+                "restart": len([i for i in incidents if i["type"] == "restart"]),
+                "error_spike": len([i for i in incidents if i["type"] == "error_spike"]),
+                "thermal": len([i for i in incidents if i["type"] == "thermal"]),
+                "fetch_error": len([i for i in incidents if i["type"] == "fetch_error"]),
+                "latency_spike": len([i for i in incidents if i["type"] == "latency_spike"]),
+            },
+        },
+    }
+
+
+# In-memory alert config store
+alert_configs = {
+    "gpu_temp_warning": {"name": "GPU Temp Warning", "threshold": 75, "unit": "°C", "enabled": True, "severity": "warning"},
+    "gpu_temp_critical": {"name": "GPU Temp Critical", "threshold": 85, "unit": "°C", "enabled": True, "severity": "critical"},
+    "gpu_util_low": {"name": "GPU Utilization Low", "threshold": 10, "unit": "%", "enabled": True, "severity": "info", "direction": "below"},
+    "error_rate_warning": {"name": "Error Rate Warning", "threshold": 5, "unit": "%", "enabled": True, "severity": "warning"},
+    "error_rate_critical": {"name": "Error Rate Critical", "threshold": 15, "unit": "%", "enabled": True, "severity": "critical"},
+    "vram_high": {"name": "VRAM Usage High", "threshold": 90, "unit": "%", "enabled": True, "severity": "warning"},
+    "ttft_slow": {"name": "TTFT Slow", "threshold": 500, "unit": "ms", "enabled": True, "severity": "warning"},
+    "power_high": {"name": "Power Draw High", "threshold": 90, "unit": "% of limit", "enabled": True, "severity": "warning"},
+    "latency_high": {"name": "Cluster Latency High", "threshold": 100, "unit": "ms", "enabled": True, "severity": "warning"},
+    "disk_full": {"name": "Disk Usage High", "threshold": 85, "unit": "%", "enabled": True, "severity": "warning"},
+}
+
+
+@app.get("/api/alerts-config")
+async def get_alerts_config():
+    """Custom Alerts Config — get/set alert thresholds."""
+    # Evaluate current state against thresholds
+    active_alerts = []
+    now = time.time()
+
+    for sk in SERVERS:
+        try:
+            data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=10)
+        except Exception:
+            data = None
+        if not data or data.get("status") == "offline":
+            continue
+        sname = SERVERS[sk]["name"]
+        gpus = data.get("gpus", [])
+
+        for g in gpus:
+            temp = g.get("temp", 0) or 0
+            cfg = alert_configs["gpu_temp_warning"]
+            if cfg["enabled"] and temp >= cfg["threshold"]:
+                active_alerts.append({"rule": "gpu_temp_warning", "server": sname, "gpu": g["index"], "value": temp, "threshold": cfg["threshold"]})
+            cfg = alert_configs["gpu_temp_critical"]
+            if cfg["enabled"] and temp >= cfg["threshold"]:
+                active_alerts.append({"rule": "gpu_temp_critical", "server": sname, "gpu": g["index"], "value": temp, "threshold": cfg["threshold"]})
+
+            util = g.get("gpu_util", 0)
+            cfg = alert_configs["gpu_util_low"]
+            if cfg["enabled"] and util <= cfg["threshold"]:
+                active_alerts.append({"rule": "gpu_util_low", "server": sname, "gpu": g["index"], "value": util, "threshold": cfg["threshold"]})
+
+            mem_pct = g["mem_used"] / max(g["mem_total"], 1) * 100
+            cfg = alert_configs["vram_high"]
+            if cfg["enabled"] and mem_pct >= cfg["threshold"]:
+                active_alerts.append({"rule": "vram_high", "server": sname, "gpu": g["index"], "value": round(mem_pct, 1), "threshold": cfg["threshold"]})
+
+            pow_pct = g["power_draw"] / max(g["power_limit"], 1) * 100
+            cfg = alert_configs["power_high"]
+            if cfg["enabled"] and pow_pct >= cfg["threshold"]:
+                active_alerts.append({"rule": "power_high", "server": sname, "gpu": g["index"], "value": round(pow_pct, 1), "threshold": cfg["threshold"]})
+
+    return {
+        "configs": alert_configs,
+        "active_alerts": active_alerts,
+        "active_count": len(active_alerts),
+    }
+
+
+@app.post("/api/alerts-config")
+async def update_alerts_config(request: Request):
+    """Update alert thresholds."""
+    body = await request.json()
+    rule_id = body.get("rule_id")
+    if rule_id not in alert_configs:
+        return {"error": "Unknown rule"}
+    if "threshold" in body:
+        alert_configs[rule_id]["threshold"] = float(body["threshold"])
+    if "enabled" in body:
+        alert_configs[rule_id]["enabled"] = bool(body["enabled"])
+    return {"ok": True, "configs": alert_configs}
+
+
+# SLA targets (in-memory)
+sla_targets = {
+    "uptime": {"name": "Uptime", "target": 99.9, "unit": "%"},
+    "ttft_p95": {"name": "TTFT P95", "target": 500, "unit": "ms"},
+    "error_rate": {"name": "Error Rate", "target": 1.0, "unit": "%"},
+    "gpu_util_avg": {"name": "Avg GPU Utilization", "target": 40, "unit": "%", "direction": "above"},
+    "vram_headroom": {"name": "VRAM Headroom", "target": 10, "unit": "%", "direction": "above"},
+}
+
+
+@app.get("/api/sla")
+async def get_sla():
+    """SLA Dashboard — user-defined SLA targets with compliance tracking."""
+    now = time.time()
+    results = {}
+
+    # Pre-fetch latest data for all servers
+    server_data = {}
+    for sk in SERVERS:
+        try:
+            server_data[sk] = await asyncio.wait_for(fetch_gpu_data(sk), timeout=10)
+        except Exception:
+            server_data[sk] = None
+
+    for sla_id, sla in sla_targets.items():
+        current_value = None
+        compliant = True
+        trend_values = []
+
+        if sla_id == "uptime":
+            # Calculate from service_uptime data
+            total_up = 0
+            total_samples = 0
+            for name, su in service_uptime.items():
+                total_up += su.get("up_samples", 0)
+                total_samples += su.get("total_samples", 0)
+            current_value = round(total_up / max(total_samples, 1) * 100, 2) if total_samples > 0 else 100.0
+            compliant = current_value >= sla["target"]
+
+        elif sla_id == "ttft_p95":
+            # Get from latest vllm metrics
+            all_ttft = []
+            for sk in SERVERS:
+                data = server_data.get(sk)
+                if data and "vllm" in data:
+                    for port_data in data["vllm"]:
+                        ttft = port_data.get("ttft_ms", {}).get("p95")
+                        if ttft is not None:
+                            all_ttft.append(ttft)
+            current_value = round(max(all_ttft), 1) if all_ttft else 0
+            compliant = current_value <= sla["target"]
+
+        elif sla_id == "error_rate":
+            # Average error rate across servers
+            rates = []
+            for sk in SERVERS:
+                errs = list(error_history.get(sk, []))
+                if errs:
+                    rates.append(errs[-1].get("rate", 0))
+            current_value = round(sum(rates) / max(len(rates), 1), 2)
+            compliant = current_value <= sla["target"]
+            # Build trend from error_history
+            for sk in SERVERS:
+                for e in error_history.get(sk, []):
+                    trend_values.append({"t": e["t"], "v": e.get("rate", 0)})
+
+        elif sla_id == "gpu_util_avg":
+            # Average GPU utilization
+            utils = []
+            for sk in SERVERS:
+                data = server_data.get(sk)
+                if data and data.get("status") != "offline":
+                    for g in data.get("gpus", []):
+                        utils.append(g.get("gpu_util", 0))
+            current_value = round(sum(utils) / max(len(utils), 1), 1)
+            compliant = current_value >= sla["target"]
+
+        elif sla_id == "vram_headroom":
+            # Minimum VRAM free across all GPUs
+            headrooms = []
+            for sk in SERVERS:
+                data = server_data.get(sk)
+                if data and data.get("status") != "offline":
+                    for g in data.get("gpus", []):
+                        if g["mem_total"] > 0:
+                            headrooms.append((1 - g["mem_used"] / g["mem_total"]) * 100)
+            current_value = round(min(headrooms), 1) if headrooms else 100.0
+            compliant = current_value >= sla["target"]
+
+        # Build 24h compliance from history
+        compliance_24h = []
+        for sk in SERVERS:
+            hist = list(history.get(sk, []))
+            for h in hist:
+                if h["t"] > now - 86400:
+                    if sla_id == "gpu_util_avg":
+                        gpus = h.get("gpus", [])
+                        if gpus:
+                            avg = sum(g.get("gpu_util", 0) for g in gpus) / len(gpus)
+                            compliance_24h.append({"t": h["t"], "compliant": avg >= sla["target"], "value": round(avg, 1)})
+
+        results[sla_id] = {
+            "name": sla["name"],
+            "target": sla["target"],
+            "unit": sla["unit"],
+            "direction": sla.get("direction", "below"),
+            "current_value": current_value,
+            "compliant": compliant,
+            "trend": sorted(trend_values, key=lambda x: x["t"])[-50:] if trend_values else [],
+        }
+
+    # Overall SLA score
+    total = len(results)
+    met = sum(1 for r in results.values() if r["compliant"])
+
+    return {
+        "targets": results,
+        "overall": {
+            "met": met,
+            "total": total,
+            "score": round(met / max(total, 1) * 100, 0),
+            "grade": "A" if met == total else "B" if met >= total - 1 else "C" if met >= total - 2 else "D",
+        },
+    }
+
+
+@app.post("/api/sla")
+async def update_sla(request: Request):
+    """Update SLA target."""
+    body = await request.json()
+    sla_id = body.get("sla_id")
+    if sla_id not in sla_targets:
+        return {"error": "Unknown SLA"}
+    if "target" in body:
+        sla_targets[sla_id]["target"] = float(body["target"])
+    return {"ok": True, "targets": sla_targets}
 
 
 @app.get("/api/executive")
@@ -2755,6 +3072,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('livecalls')" id="tab-livecalls">Live Calls</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('modelcompare')" id="tab-modelcompare">Model Compare</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('power')" id="tab-power">Power Mgmt</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('incidents')" id="tab-incidents">Incidents</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('alertsconfig')" id="tab-alertsconfig">Alert Config</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('sla')" id="tab-sla">SLA</button>
 </div>
 
 <!-- Content -->
@@ -2774,6 +3094,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-livecalls" class="hidden"></div>
   <div id="page-modelcompare" class="hidden"></div>
   <div id="page-power" class="hidden"></div>
+  <div id="page-incidents" class="hidden"></div>
+  <div id="page-alertsconfig" class="hidden"></div>
+  <div id="page-sla" class="hidden"></div>
 </div>
 
 <script>
@@ -2800,6 +3123,9 @@ let executiveData = null;
 let livecallsData = null;
 let modelcompareData = null;
 let powerData = null;
+let incidentsData = null;
+let alertsconfigData = null;
+let slaData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -2836,7 +3162,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power','incidents','alertsconfig','sla'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -2853,6 +3179,9 @@ function switchTab(tab) {
   if (tab === 'livecalls') loadLiveCalls();
   if (tab === 'modelcompare') loadModelCompare();
   if (tab === 'power') loadPower();
+  if (tab === 'incidents') loadIncidents();
+  if (tab === 'alertsconfig') loadAlertsConfig();
+  if (tab === 'sla') loadSLA();
 }
 
 // ── Overview Tab ──
@@ -4528,6 +4857,9 @@ function renderAll() {
   else if (activeTab === 'livecalls') renderLiveCalls();
   else if (activeTab === 'modelcompare') renderModelCompare();
   else if (activeTab === 'power') renderPower();
+  else if (activeTab === 'incidents') renderIncidents();
+  else if (activeTab === 'alertsconfig') renderAlertsConfig();
+  else if (activeTab === 'sla') renderSLA();
 }
 
 // ── Live Call Tracker Tab ──
@@ -4741,6 +5073,181 @@ function renderPower() {
     }
     html += '</div>';
   }
+
+  el.innerHTML = html;
+}
+
+// ── Incidents Tab ──
+async function loadIncidents() {
+  try { const r = await fetch('/api/incidents'); incidentsData = await r.json(); renderIncidents(); } catch(e) { console.error(e); }
+}
+function renderIncidents() {
+  const el = document.getElementById('page-incidents');
+  if (!incidentsData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = incidentsData;
+  const s = d.summary || {};
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Incident Summary</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Service events, error spikes, and anomalies</p>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">';
+  html += `<div class="glass-bright rounded-lg p-3 text-center"><div class="text-2xl font-bold text-white">${s.total||0}</div><div class="text-[10px] text-gray-500">Total</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3 text-center"><div class="text-2xl font-bold text-amber-400">${s.last_hour||0}</div><div class="text-[10px] text-gray-500">Last Hour</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3 text-center"><div class="text-2xl font-bold text-gray-300">${s.last_24h||0}</div><div class="text-[10px] text-gray-500">Last 24h</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3 text-center"><div class="text-2xl font-bold text-red-400">${s.critical_count||0}</div><div class="text-[10px] text-gray-500">Critical</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3 text-center"><div class="text-2xl font-bold text-amber-400">${s.warning_count||0}</div><div class="text-[10px] text-gray-500">Warnings</div></div>`;
+  html += '</div>';
+
+  // By type breakdown
+  const bt = s.by_type || {};
+  html += '<div class="grid grid-cols-5 gap-2 mb-4">';
+  for (const [type, count] of Object.entries(bt)) {
+    const icon = type === 'restart' ? '🔄' : type === 'error_spike' ? '⚠' : type === 'thermal' ? '🌡' : type === 'fetch_error' ? '🔌' : '📡';
+    html += `<div class="glass-bright rounded-lg p-2 text-center text-[10px]"><div class="text-sm">${icon}</div><div class="text-white font-medium">${count}</div><div class="text-gray-500">${type.replace('_',' ')}</div></div>`;
+  }
+  html += '</div></div>';
+
+  // Timeline
+  html += '<div class="glass rounded-xl p-6"><h3 class="text-white font-semibold mb-4">Timeline</h3>';
+  html += '<div class="space-y-2">';
+  for (const inc of (d.incidents || []).slice(0, 50)) {
+    const time = new Date(inc.t * 1000).toLocaleString();
+    const sevC = inc.severity === 'critical' ? 'border-red-500 bg-red-500/10' : inc.severity === 'warning' ? 'border-amber-500 bg-amber-500/10' : 'border-blue-500 bg-blue-500/10';
+    const sevT = inc.severity === 'critical' ? 'text-red-400' : inc.severity === 'warning' ? 'text-amber-400' : 'text-blue-400';
+    html += `<div class="border-l-2 ${sevC} rounded-r-lg p-3">`;
+    html += `<div class="flex justify-between items-start"><div><span class="${sevT} text-xs font-medium">${inc.severity.toUpperCase()}</span> <span class="text-white text-sm ml-2">${inc.title}</span></div>`;
+    html += `<span class="text-[10px] text-gray-500 flex-shrink-0">${time}</span></div>`;
+    html += `<div class="text-[10px] text-gray-400 mt-1">${inc.detail}</div>`;
+    html += '</div>';
+  }
+  if ((d.incidents || []).length === 0) {
+    html += '<div class="text-gray-500 text-sm text-center py-4">No incidents recorded yet. Data builds up over time.</div>';
+  }
+  html += '</div></div>';
+
+  el.innerHTML = html;
+}
+
+// ── Alerts Config Tab ──
+async function loadAlertsConfig() {
+  try { const r = await fetch('/api/alerts-config'); alertsconfigData = await r.json(); renderAlertsConfig(); } catch(e) { console.error(e); }
+}
+async function updateAlertThreshold(ruleId, field, value) {
+  try {
+    await fetch('/api/alerts-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({rule_id: ruleId, [field]: value})
+    });
+    loadAlertsConfig();
+  } catch(e) { console.error(e); }
+}
+function renderAlertsConfig() {
+  const el = document.getElementById('page-alertsconfig');
+  if (!alertsconfigData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = alertsconfigData;
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Alert Configuration</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Customize alert thresholds — changes take effect immediately</p>';
+  html += `<div class="text-xs text-gray-400 mb-4">${d.active_count||0} active alert(s) right now</div>`;
+
+  html += '<div class="space-y-3">';
+  for (const [ruleId, cfg] of Object.entries(d.configs || {})) {
+    const sevC = cfg.severity === 'critical' ? 'text-red-400' : cfg.severity === 'warning' ? 'text-amber-400' : 'text-blue-400';
+    html += `<div class="glass-bright rounded-lg p-4 flex items-center justify-between">`;
+    html += `<div class="flex-1"><span class="text-white text-sm font-medium">${cfg.name}</span> <span class="${sevC} text-[10px]">${cfg.severity}</span>`;
+    html += `<div class="text-[10px] text-gray-500 mt-1">Rule: ${ruleId}</div></div>`;
+    html += `<div class="flex items-center gap-3">`;
+    html += `<div class="flex items-center gap-1"><input type="number" value="${cfg.threshold}" onchange="updateAlertThreshold('${ruleId}','threshold',this.value)" class="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs text-right" />`;
+    html += `<span class="text-[10px] text-gray-500">${cfg.unit}</span></div>`;
+    html += `<label class="flex items-center gap-1 cursor-pointer"><input type="checkbox" ${cfg.enabled?'checked':''} onchange="updateAlertThreshold('${ruleId}','enabled',this.checked)" class="accent-emerald-500" /><span class="text-[10px] text-gray-400">On</span></label>`;
+    html += '</div></div>';
+  }
+  html += '</div></div>';
+
+  // Active alerts
+  if ((d.active_alerts||[]).length > 0) {
+    html += '<div class="glass rounded-xl p-6"><h3 class="text-white font-semibold mb-4">Currently Triggered Alerts</h3>';
+    html += '<div class="space-y-2">';
+    for (const a of d.active_alerts) {
+      const cfg = (d.configs||{})[a.rule] || {};
+      const sevC = cfg.severity === 'critical' ? 'text-red-400 border-red-500' : 'text-amber-400 border-amber-500';
+      html += `<div class="border-l-2 ${sevC} bg-white/[0.02] rounded-r-lg p-3 flex justify-between">`;
+      html += `<div><span class="${sevC} text-xs font-medium">${cfg.name||a.rule}</span>`;
+      html += `<div class="text-[10px] text-gray-400">${a.server} · GPU ${a.gpu}</div></div>`;
+      html += `<div class="text-right"><div class="text-white text-sm font-bold">${a.value}${cfg.unit||''}</div>`;
+      html += `<div class="text-[10px] text-gray-500">threshold: ${a.threshold}${cfg.unit||''}</div></div>`;
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── SLA Dashboard Tab ──
+async function loadSLA() {
+  try { const r = await fetch('/api/sla'); slaData = await r.json(); renderSLA(); } catch(e) { console.error(e); }
+}
+async function updateSLATarget(slaId, value) {
+  try {
+    await fetch('/api/sla', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sla_id: slaId, target: value})
+    });
+    loadSLA();
+  } catch(e) { console.error(e); }
+}
+function renderSLA() {
+  const el = document.getElementById('page-sla');
+  if (!slaData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = slaData;
+  const ov = d.overall || {};
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">SLA Compliance Overview</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Track service level objectives across the fleet</p>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  const gradeC = ov.grade === 'A' ? 'text-emerald-400' : ov.grade === 'B' ? 'text-cyan-400' : ov.grade === 'C' ? 'text-amber-400' : 'text-red-400';
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-5xl font-bold ${gradeC}">${ov.grade||'?'}</div><div class="text-[10px] text-gray-500 mt-1">Grade</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-white">${ov.score||0}%</div><div class="text-[10px] text-gray-500 mt-1">Score</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-emerald-400">${ov.met||0}</div><div class="text-[10px] text-gray-500 mt-1">SLAs Met</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-3xl font-bold text-gray-300">${ov.total||0}</div><div class="text-[10px] text-gray-500 mt-1">Total SLAs</div></div>`;
+  html += '</div></div>';
+
+  // Individual SLA cards
+  html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+  for (const [slaId, sla] of Object.entries(d.targets || {})) {
+    const met = sla.compliant;
+    const borderC = met ? 'border-emerald-500/30' : 'border-red-500/30';
+    const bgC = met ? 'bg-emerald-500/5' : 'bg-red-500/5';
+    const statusC = met ? 'text-emerald-400' : 'text-red-400';
+    const statusIcon = met ? '✓' : '✗';
+
+    html += `<div class="glass rounded-xl p-5 border ${borderC} ${bgC}">`;
+    html += `<div class="flex justify-between items-center mb-3">`;
+    html += `<div><span class="text-white text-sm font-medium">${sla.name}</span><div class="text-[10px] text-gray-500 mt-0.5">${sla.direction === 'above' ? '≥' : '≤'} target</div></div>`;
+    html += `<span class="${statusC} text-xl font-bold">${statusIcon}</span>`;
+    html += '</div>';
+
+    html += '<div class="grid grid-cols-3 gap-3 mb-3">';
+    html += `<div><div class="text-[10px] text-gray-500">Current</div><div class="text-lg font-bold ${statusC}">${sla.current_value !== null ? sla.current_value : '—'}${sla.unit}</div></div>`;
+    html += `<div><div class="text-[10px] text-gray-500">Target</div><div class="text-lg font-bold text-gray-300">${sla.target}${sla.unit}</div></div>`;
+    html += `<div><div class="text-[10px] text-gray-500">Set Target</div>`;
+    html += `<input type="number" value="${sla.target}" step="any" onchange="updateSLATarget('${slaId}',this.value)" class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs mt-1" /></div>`;
+    html += '</div>';
+
+    // Progress bar
+    let pct;
+    if (sla.direction === 'above') {
+      pct = sla.target > 0 ? Math.min(sla.current_value / sla.target * 100, 100) : 0;
+    } else {
+      pct = sla.target > 0 ? Math.min((1 - sla.current_value / sla.target) * 100 + 50, 100) : 100;
+    }
+    const barC = met ? '#22c55e' : '#ef4444';
+    html += `<div class="bar-track rounded-full h-2"><div class="bar-fill rounded-full h-2" style="width:${Math.max(pct,5)}%;background:${barC}"></div></div>`;
+    html += '</div>';
+  }
+  html += '</div>';
 
   el.innerHTML = html;
 }

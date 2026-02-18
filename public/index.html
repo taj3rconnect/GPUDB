@@ -56,8 +56,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
     <div class="flex items-center gap-4">
       <div class="text-xs text-gray-500">
         Refresh: <select id="refreshRate" onchange="updateRefreshRate()" class="bg-surface-100 border border-gray-700 rounded px-2 py-1 text-gray-300 text-xs">
-          <option value="3000">3s</option><option value="5000">5s</option><option value="10000">10s</option><option value="30000">30s</option>
+          <option value="3000">3s</option><option value="5000">5s</option><option value="10000">10s</option><option value="30000">30s</option><option value="60000">1m</option><option value="300000">5m</option><option value="600000">10m</option><option value="900000">15m</option><option value="3600000">1h</option>
         </select>
+        <span id="nightModeLabel" style="display:none;color:#f59e0b;margin-left:6px" title="Auto hourly refresh 10PM-8AM EST">🌙 Night</span>
       </div>
       <div id="lastUpdate" class="text-xs text-gray-500"></div>
     </div>
@@ -2665,16 +2666,39 @@ async function refresh() {
   document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }
 
-function updateRefreshRate() {
-  refreshRate = parseInt(document.getElementById('refreshRate').value);
+function updateRefreshRate(val) {
+  refreshRate = val || parseInt(document.getElementById('refreshRate').value);
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = setInterval(refresh, refreshRate);
+}
+
+function checkNightMode() {
+  const now = new Date();
+  const est = new Date(now.toLocaleString('en-US', {timeZone: 'America/New_York'}));
+  const h = est.getHours();
+  const isNight = h >= 22 || h < 8;
+  const sel = document.getElementById('refreshRate');
+  const nightLabel = document.getElementById('nightModeLabel');
+  if (isNight && !window._nightModeActive) {
+    window._nightModePrev = sel.value;
+    window._nightModeActive = true;
+    sel.value = '3600000';
+    updateRefreshRate(3600000);
+    if (nightLabel) nightLabel.style.display = 'inline';
+  } else if (!isNight && window._nightModeActive) {
+    window._nightModeActive = false;
+    sel.value = window._nightModePrev || '3000';
+    updateRefreshRate(parseInt(sel.value));
+    if (nightLabel) nightLabel.style.display = 'none';
+  }
 }
 
 // Init
 renderOverview();
 refresh();
 refreshInterval = setInterval(refresh, refreshRate);
+checkNightMode();
+setInterval(checkNightMode, 60000);
 </script>
 </body>
 </html>

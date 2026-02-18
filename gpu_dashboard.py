@@ -641,6 +641,305 @@ async def get_agent_status():
         return {"error": str(e), "status": "offline"}
 
 
+@app.get("/api/livecalls")
+async def get_live_calls():
+    """Live Call Tracker — real-time active calls with per-call metrics."""
+    now = time.time()
+    result = {"calls": [], "summary": {}, "recent_completed": []}
+
+    # Active calls from vLLM running requests + agent connections
+    total_active = 0
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            continue
+        latest = sk_hist[-1]
+        calls = latest.get("calls", 0)
+        total_active += calls
+
+        # Build per-server call info
+        running = latest.get("requests_running", 0)
+        waiting = latest.get("requests_waiting", 0)
+        active_conn = latest.get("active_connections", 0)
+        ttft = latest.get("ttft_ms", 0)
+        e2e = latest.get("e2e_s", 0)
+        kv = latest.get("kv_cache", 0)
+        util = latest.get("avg_util", 0)
+
+        if calls > 0 or running > 0 or active_conn > 0:
+            result["calls"].append({
+                "server": sk,
+                "server_name": SERVERS[sk]["name"],
+                "active_calls": calls,
+                "requests_running": running,
+                "requests_waiting": waiting,
+                "active_connections": active_conn,
+                "current_ttft_ms": round(ttft, 1),
+                "current_e2e_s": round(e2e, 3),
+                "current_kv_cache": round(kv, 1),
+                "current_gpu_util": round(util, 1),
+                "timestamp": latest.get("t", now),
+            })
+
+    # Call history timeline (last 120 points)
+    call_timeline = []
+    for sk in SERVERS:
+        for p in list(history[sk])[-120:]:
+            call_timeline.append({
+                "t": p["t"], "server": sk,
+                "calls": p.get("calls", 0),
+                "ttft_ms": p.get("ttft_ms", 0),
+                "e2e_s": p.get("e2e_s", 0),
+                "gpu_util": p.get("avg_util", 0),
+                "kv_cache": p.get("kv_cache", 0),
+            })
+    call_timeline.sort(key=lambda x: x["t"])
+
+    # Summary stats
+    all_hist = []
+    for sk in SERVERS:
+        all_hist.extend(list(history[sk]))
+    if all_hist:
+        calls_arr = [p.get("calls", 0) for p in all_hist]
+        result["summary"] = {
+            "total_active_now": total_active,
+            "peak_concurrent": max(calls_arr),
+            "avg_concurrent": round(sum(calls_arr) / len(calls_arr), 1),
+            "zero_call_pct": round(sum(1 for c in calls_arr if c == 0) / len(calls_arr) * 100, 1),
+            "timeline": call_timeline[-60:],
+        }
+
+    # Call duration distribution from e2e history
+    e2e_vals = [p.get("e2e_s", 0) for p in all_hist if p.get("e2e_s", 0) > 0]
+    if e2e_vals:
+        buckets = {"<1s": 0, "1-3s": 0, "3-5s": 0, "5-10s": 0, ">10s": 0}
+        for v in e2e_vals:
+            if v < 1: buckets["<1s"] += 1
+            elif v < 3: buckets["1-3s"] += 1
+            elif v < 5: buckets["3-5s"] += 1
+            elif v < 10: buckets["5-10s"] += 1
+            else: buckets[">10s"] += 1
+        result["duration_distribution"] = buckets
+
+    return result
+
+
+@app.get("/api/modelcompare")
+async def get_model_compare():
+    """A/B Model Comparison — compare model performance over time windows."""
+    result = {"models": [], "time_windows": [], "comparison": {}}
+
+    # Get current model info from latest data
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            continue
+
+        # Try to get current vLLM model info
+        try:
+            latest = await asyncio.wait_for(fetch_gpu_data(sk), timeout=10)
+            for v in latest.get("vllm", []):
+                result["models"].append({
+                    "server": sk,
+                    "server_name": SERVERS[sk]["name"],
+                    "port": v.get("port"),
+                    "model_name": v.get("model_name", "unknown"),
+                    "total_requests": v.get("total_requests", 0),
+                    "kv_cache_usage": v.get("kv_cache_usage", 0),
+                    "avg_ttft_ms": round(v.get("avg_ttft_ms", 0), 1),
+                    "avg_itl_ms": round(v.get("avg_itl_ms", 0), 1),
+                    "avg_e2e_s": round(v.get("avg_e2e_s", 0), 3),
+                    "avg_queue_s": round(v.get("avg_queue_s", 0), 4),
+                    "cache_hit_rate": v.get("cache_hit_rate", 0),
+                    "requests_running": v.get("requests_running", 0),
+                })
+        except Exception:
+            pass
+
+    # Time-windowed performance comparison (split history into quarters)
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if len(sk_hist) < 20:
+            continue
+        quarter = len(sk_hist) // 4
+        windows = []
+        labels = ["Q1 (oldest)", "Q2", "Q3", "Q4 (latest)"]
+        for i in range(4):
+            start = i * quarter
+            end = (i + 1) * quarter if i < 3 else len(sk_hist)
+            segment = sk_hist[start:end]
+            ttft = [p.get("ttft_ms", 0) for p in segment if p.get("ttft_ms", 0) > 0]
+            e2e = [p.get("e2e_s", 0) for p in segment if p.get("e2e_s", 0) > 0]
+            util = [p.get("avg_util", 0) for p in segment]
+            kv = [p.get("kv_cache", 0) for p in segment if p.get("kv_cache", 0) > 0]
+            calls = [p.get("calls", 0) for p in segment]
+
+            windows.append({
+                "label": labels[i],
+                "samples": len(segment),
+                "avg_ttft_ms": round(sum(ttft) / max(len(ttft), 1), 1),
+                "avg_e2e_s": round(sum(e2e) / max(len(e2e), 1), 3),
+                "avg_util": round(sum(util) / max(len(util), 1), 1),
+                "avg_kv": round(sum(kv) / max(len(kv), 1), 1),
+                "avg_calls": round(sum(calls) / max(len(calls), 1), 1),
+                "peak_calls": max(calls) if calls else 0,
+                "time_start": segment[0]["t"] if segment else 0,
+                "time_end": segment[-1]["t"] if segment else 0,
+            })
+
+        result["time_windows"].append({
+            "server": sk,
+            "server_name": SERVERS[sk]["name"],
+            "windows": windows,
+        })
+
+    # Efficiency comparison per server
+    for sk in SERVERS:
+        hs = hourly_stats.get(sk, {})
+        if not hs:
+            continue
+        total_tokens = 0
+        total_samples = 0
+        for hk, h in hs.items():
+            prompt_delta = h.get("_vllm_prompt_end", 0) - h.get("_vllm_prompt_start", 0)
+            gen_delta = h.get("_vllm_gen_end", 0) - h.get("_vllm_gen_start", 0)
+            total_tokens += prompt_delta + gen_delta
+            total_samples += h.get("samples", 0)
+
+        sk_hist = list(history[sk])
+        avg_power = sum(p.get("total_power", 0) for p in sk_hist[-60:]) / max(len(sk_hist[-60:]), 1) if sk_hist else 0
+
+        result["comparison"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "total_tokens_processed": total_tokens,
+            "avg_power_w": round(avg_power, 0),
+            "tokens_per_watt_hour": round(total_tokens / max(avg_power, 1) / max(total_samples * 3 / 3600, 0.01), 1) if avg_power > 0 else 0,
+        }
+
+    return result
+
+
+@app.get("/api/power")
+async def get_power():
+    """GPU Power Management — efficiency curves, tokens/watt, optimal settings."""
+    result = {"per_server": {}, "fleet_summary": {}}
+
+    for sk in SERVERS:
+        server = SERVERS[sk]
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            result["per_server"][sk] = {"server_name": server["name"], "no_data": True}
+            continue
+
+        # Power data from history
+        power_data = []
+        for p in sk_hist:
+            power_data.append({
+                "power_w": p.get("total_power", 0),
+                "util": p.get("avg_util", 0),
+                "calls": p.get("calls", 0),
+                "ttft_ms": p.get("ttft_ms", 0),
+                "e2e_s": p.get("e2e_s", 0),
+                "temp": p.get("max_temp", 0),
+            })
+
+        # Power vs utilization buckets
+        power_util_curve = {}
+        for pd in power_data:
+            bucket = int(pd["util"] // 10) * 10
+            if bucket not in power_util_curve:
+                power_util_curve[bucket] = {"power": [], "ttft": [], "e2e": [], "temp": [], "count": 0}
+            power_util_curve[bucket]["power"].append(pd["power_w"])
+            power_util_curve[bucket]["count"] += 1
+            if pd["ttft_ms"] > 0:
+                power_util_curve[bucket]["ttft"].append(pd["ttft_ms"])
+            if pd["e2e_s"] > 0:
+                power_util_curve[bucket]["e2e"].append(pd["e2e_s"])
+            power_util_curve[bucket]["temp"].append(pd["temp"])
+
+        efficiency_curve = []
+        for bucket in sorted(power_util_curve.keys()):
+            d = power_util_curve[bucket]
+            avg_power = sum(d["power"]) / len(d["power"])
+            avg_ttft = sum(d["ttft"]) / len(d["ttft"]) if d["ttft"] else 0
+            avg_temp = sum(d["temp"]) / len(d["temp"])
+            # Efficiency = work done per watt (approximated by util/power)
+            efficiency = bucket / max(avg_power, 1) * 100
+
+            efficiency_curve.append({
+                "util_bucket": bucket,
+                "avg_power_w": round(avg_power, 0),
+                "avg_temp_c": round(avg_temp, 1),
+                "avg_ttft_ms": round(avg_ttft, 1),
+                "efficiency": round(efficiency, 2),
+                "samples": d["count"],
+            })
+
+        # GPU-level power from clock history
+        per_gpu_power = []
+        for gpu_idx, clock_data in gpu_clock_history.get(sk, {}).items():
+            points = list(clock_data)
+            if points:
+                avg_power_gpu = sum(p.get("power", 0) for p in points) / len(points)
+                avg_temp_gpu = sum(p.get("temp", 0) for p in points) / len(points)
+                avg_util_gpu = sum(p.get("sm_clock", 0) for p in points) / len(points)
+                per_gpu_power.append({
+                    "gpu": gpu_idx,
+                    "avg_power_w": round(avg_power_gpu, 1),
+                    "avg_temp_c": round(avg_temp_gpu, 1),
+                    "avg_util": round(avg_util_gpu, 1),
+                })
+
+        # Current power stats
+        recent = sk_hist[-min(30, len(sk_hist)):]
+        current_power = sum(p.get("total_power", 0) for p in recent) / len(recent)
+        peak_power = max(p.get("total_power", 0) for p in sk_hist)
+        min_power = min(p.get("total_power", 0) for p in sk_hist) if sk_hist else 0
+        gpu_count = sk_hist[-1].get("gpu_count", 8)
+
+        # Optimal power point: highest efficiency (util/power ratio)
+        optimal = max(efficiency_curve, key=lambda x: x["efficiency"]) if efficiency_curve else None
+
+        # Token efficiency from hourly stats
+        hs = hourly_stats.get(sk, {})
+        total_tokens = 0
+        total_time_s = 0
+        for hk, h in hs.items():
+            total_tokens += (h.get("_vllm_prompt_end", 0) - h.get("_vllm_prompt_start", 0)) + (h.get("_vllm_gen_end", 0) - h.get("_vllm_gen_start", 0))
+            total_time_s += h.get("samples", 0) * 3
+
+        tokens_per_kwh = round(total_tokens / max(current_power / 1000 * max(total_time_s / 3600, 0.01), 0.001), 0) if current_power > 0 and total_tokens > 0 else 0
+
+        result["per_server"][sk] = {
+            "server_name": server["name"],
+            "gpu_count": gpu_count,
+            "current_power_w": round(current_power, 0),
+            "peak_power_w": round(peak_power, 0),
+            "min_power_w": round(min_power, 0),
+            "power_per_gpu_w": round(current_power / max(gpu_count, 1), 0),
+            "efficiency_curve": efficiency_curve,
+            "per_gpu": sorted(per_gpu_power, key=lambda x: x["gpu"]),
+            "optimal_point": optimal,
+            "tokens_per_kwh": tokens_per_kwh,
+            "cost_per_kwh": round(COST_PER_HOUR / max(current_power / 1000, 0.001), 2) if current_power > 0 else 0,
+        }
+
+    # Fleet summary
+    total_power = sum(s.get("current_power_w", 0) for s in result["per_server"].values() if not s.get("no_data"))
+    total_peak = sum(s.get("peak_power_w", 0) for s in result["per_server"].values() if not s.get("no_data"))
+    result["fleet_summary"] = {
+        "total_current_w": round(total_power, 0),
+        "total_peak_w": round(total_peak, 0),
+        "total_current_kw": round(total_power / 1000, 2),
+        "monthly_kwh": round(total_power / 1000 * 730, 0),
+        "power_cost_estimate": round(total_power / 1000 * 730 * 0.10, 0),  # ~$0.10/kWh
+        "gpu_monthly_cost": GPU_MONTHLY_COST,
+        "power_as_pct_of_cost": round(total_power / 1000 * 730 * 0.10 / max(GPU_MONTHLY_COST, 1) * 100, 1),
+    }
+
+    return result
+
+
 @app.get("/api/executive")
 async def get_executive():
     """Executive Summary — health score, daily report, H200 vs RTX 5090 comparison."""
@@ -2453,6 +2752,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('network')" id="tab-network">Network & I/O</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('executive')" id="tab-executive">Executive Summary</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('livecalls')" id="tab-livecalls">Live Calls</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('modelcompare')" id="tab-modelcompare">Model Compare</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('power')" id="tab-power">Power Mgmt</button>
 </div>
 
 <!-- Content -->
@@ -2469,6 +2771,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-quality" class="hidden"></div>
   <div id="page-network" class="hidden"></div>
   <div id="page-executive" class="hidden"></div>
+  <div id="page-livecalls" class="hidden"></div>
+  <div id="page-modelcompare" class="hidden"></div>
+  <div id="page-power" class="hidden"></div>
 </div>
 
 <script>
@@ -2492,6 +2797,9 @@ let capacityData = null;
 let qualityData = null;
 let networkData = null;
 let executiveData = null;
+let livecallsData = null;
+let modelcompareData = null;
+let powerData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -2528,7 +2836,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -2542,6 +2850,9 @@ function switchTab(tab) {
   if (tab === 'quality') loadQuality();
   if (tab === 'network') loadNetwork();
   if (tab === 'executive') loadExecutive();
+  if (tab === 'livecalls') loadLiveCalls();
+  if (tab === 'modelcompare') loadModelCompare();
+  if (tab === 'power') loadPower();
 }
 
 // ── Overview Tab ──
@@ -4214,6 +4525,224 @@ function renderAll() {
   else if (activeTab === 'quality') renderQuality();
   else if (activeTab === 'network') renderNetwork();
   else if (activeTab === 'executive') renderExecutive();
+  else if (activeTab === 'livecalls') renderLiveCalls();
+  else if (activeTab === 'modelcompare') renderModelCompare();
+  else if (activeTab === 'power') renderPower();
+}
+
+// ── Live Call Tracker Tab ──
+async function loadLiveCalls() {
+  try { const r = await fetch('/api/livecalls'); livecallsData = await r.json(); renderLiveCalls(); } catch(e) { console.error(e); }
+}
+function renderLiveCalls() {
+  const el = document.getElementById('page-livecalls');
+  if (!livecallsData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = livecallsData;
+  const s = d.summary || {};
+
+  // Active calls cards
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Active Calls Now</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Real-time view of concurrent calls across servers</p>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-emerald-400">${s.total_active_now||0}</div><div class="text-[10px] text-gray-500 mt-1">Active Now</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-cyan-400">${s.peak_concurrent||0}</div><div class="text-[10px] text-gray-500 mt-1">Peak</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-gray-300">${s.avg_concurrent||0}</div><div class="text-[10px] text-gray-500 mt-1">Avg</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-amber-400">${s.zero_call_pct||0}%</div><div class="text-[10px] text-gray-500 mt-1">Idle Time</div></div>`;
+  html += '</div>';
+
+  // Per-server active calls
+  for (const c of (d.calls||[])) {
+    const utilC = c.current_gpu_util > 80 ? 'text-red-400' : c.current_gpu_util > 50 ? 'text-amber-400' : 'text-emerald-400';
+    html += `<div class="glass-bright rounded-lg p-3 mb-2 flex items-center justify-between">`;
+    html += `<div><span class="text-white text-sm font-medium">${c.server_name}</span>`;
+    html += `<div class="text-[10px] text-gray-500">Running: ${c.requests_running} | Waiting: ${c.requests_waiting} | Connections: ${c.active_connections}</div></div>`;
+    html += `<div class="flex gap-4 text-[10px]">`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-white">${c.active_calls}</div><div class="text-gray-500">Calls</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold ${utilC}">${c.current_gpu_util}%</div><div class="text-gray-500">GPU</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-cyan-400">${c.current_ttft_ms}ms</div><div class="text-gray-500">TTFT</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-gray-300">${c.current_e2e_s}s</div><div class="text-gray-500">E2E</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-gray-300">${c.current_kv_cache}%</div><div class="text-gray-500">KV</div></div>`;
+    html += '</div></div>';
+  }
+  html += '</div>';
+
+  // Call timeline
+  const tl = s.timeline || [];
+  if (tl.length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Call Timeline</h3>';
+    html += '<p class="text-xs text-gray-500 mb-4">Concurrent calls over time</p>';
+    const maxC = Math.max(...tl.map(t=>t.calls), 1);
+    html += '<div class="space-y-0.5">';
+    for (const t of tl.slice(-40)) {
+      const time = new Date(t.t * 1000).toLocaleTimeString();
+      const barW = t.calls / maxC * 100;
+      const barC = t.calls > 5 ? 'bg-red-500/60' : t.calls > 2 ? 'bg-amber-500/60' : 'bg-emerald-500/60';
+      html += `<div class="flex items-center gap-1 text-[9px]"><span class="text-gray-600 w-14">${time}</span><span class="text-gray-500 w-4">${t.server[0]}</span>`;
+      html += `<div class="flex-1 h-3 rounded bg-gray-800"><div class="${barC} h-3 rounded" style="width:${barW}%"></div></div>`;
+      html += `<span class="text-gray-400 w-20 text-right">${t.calls}c ${t.gpu_util.toFixed(0)}%</span></div>`;
+    }
+    html += '</div></div>';
+  }
+
+  // Duration distribution
+  const dd = d.duration_distribution || {};
+  if (Object.keys(dd).length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Call Duration Distribution</h3>';
+    html += '<div class="grid grid-cols-5 gap-2">';
+    const maxDD = Math.max(...Object.values(dd), 1);
+    for (const [label, count] of Object.entries(dd)) {
+      const pct = count / maxDD * 100;
+      html += `<div class="text-center"><div class="h-20 flex items-end justify-center mb-1"><div class="w-8 rounded-t bg-cyan-500/50" style="height:${pct}%"></div></div>`;
+      html += `<div class="text-[10px] text-gray-400">${label}</div><div class="text-[10px] text-white font-medium">${count}</div></div>`;
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Model Compare Tab ──
+async function loadModelCompare() {
+  try { const r = await fetch('/api/modelcompare'); modelcompareData = await r.json(); renderModelCompare(); } catch(e) { console.error(e); }
+}
+function renderModelCompare() {
+  const el = document.getElementById('page-modelcompare');
+  if (!modelcompareData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = modelcompareData;
+
+  // Active models
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Active Models</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Currently loaded vLLM models and their metrics</p>';
+  if ((d.models||[]).length === 0) {
+    html += '<div class="text-gray-500 text-sm">No vLLM models detected.</div>';
+  } else {
+    html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const m of d.models) {
+      html += `<div class="glass-bright rounded-lg p-4">`;
+      html += `<div class="flex justify-between items-center mb-2"><span class="text-white text-sm font-medium">${m.model_name}</span><span class="text-[10px] text-gray-500">${m.server_name} :${m.port}</span></div>`;
+      html += '<div class="grid grid-cols-3 gap-2 text-[10px]">';
+      html += `<div><span class="text-gray-500">TTFT</span><div class="${m.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400'} font-medium">${m.avg_ttft_ms}ms</div></div>`;
+      html += `<div><span class="text-gray-500">ITL</span><div class="text-gray-300 font-medium">${m.avg_itl_ms}ms</div></div>`;
+      html += `<div><span class="text-gray-500">E2E</span><div class="${m.avg_e2e_s > 3 ? 'text-amber-400' : 'text-emerald-400'} font-medium">${m.avg_e2e_s}s</div></div>`;
+      html += `<div><span class="text-gray-500">Queue</span><div class="text-gray-300 font-medium">${m.avg_queue_s}s</div></div>`;
+      html += `<div><span class="text-gray-500">KV Cache</span><div class="${m.kv_cache_usage > 80 ? 'text-red-400' : 'text-emerald-400'} font-medium">${m.kv_cache_usage}%</div></div>`;
+      html += `<div><span class="text-gray-500">Cache Hit</span><div class="text-cyan-400 font-medium">${m.cache_hit_rate}%</div></div>`;
+      html += `<div><span class="text-gray-500">Running</span><div class="text-white font-medium">${m.requests_running}</div></div>`;
+      html += `<div><span class="text-gray-500">Total Reqs</span><div class="text-white font-medium">${(m.total_requests||0).toLocaleString()}</div></div>`;
+      html += '</div></div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Time-windowed comparison
+  for (const tw of (d.time_windows||[])) {
+    html += `<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">${tw.server_name} — Performance Over Time</h3>`;
+    html += '<p class="text-xs text-gray-500 mb-4">Data split into quarters to detect changes</p>';
+    html += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+    html += '<thead><tr class="text-gray-500 border-b border-gray-800"><th class="text-left py-2 px-2">Window</th><th class="text-right py-2 px-2">TTFT</th><th class="text-right py-2 px-2">E2E</th><th class="text-right py-2 px-2">GPU Util</th><th class="text-right py-2 px-2">KV Cache</th><th class="text-right py-2 px-2">Avg Calls</th><th class="text-right py-2 px-2">Peak</th><th class="text-right py-2 px-2">Samples</th></tr></thead><tbody>';
+    for (const w of (tw.windows||[])) {
+      const isLatest = w.label.includes('latest');
+      const rowClass = isLatest ? 'bg-emerald-500/10' : '';
+      html += `<tr class="border-b border-gray-800/50 ${rowClass}">`;
+      html += `<td class="py-2 px-2 text-white font-medium">${w.label}</td>`;
+      html += `<td class="py-2 px-2 text-right ${w.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-gray-300'}">${w.avg_ttft_ms}ms</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_e2e_s}s</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_util}%</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_kv}%</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_calls}</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.peak_calls}</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-500">${w.samples}</td>`;
+      html += '</tr>';
+    }
+    html += '</tbody></table></div></div>';
+  }
+
+  // Efficiency comparison
+  const comp = d.comparison || {};
+  if (Object.keys(comp).length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Token Efficiency Comparison</h3>';
+    html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const [sk, c] of Object.entries(comp)) {
+      html += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-2">${c.server_name}</div>`;
+      html += `<div class="grid grid-cols-3 gap-2 text-[10px]">`;
+      html += `<div><span class="text-gray-500">Total Tokens</span><div class="text-white font-medium">${(c.total_tokens_processed||0).toLocaleString()}</div></div>`;
+      html += `<div><span class="text-gray-500">Avg Power</span><div class="text-gray-300 font-medium">${c.avg_power_w}W</div></div>`;
+      html += `<div><span class="text-gray-500">Tokens/Wh</span><div class="text-cyan-400 font-medium">${c.tokens_per_watt_hour}</div></div>`;
+      html += '</div></div>';
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Power Management Tab ──
+async function loadPower() {
+  try { const r = await fetch('/api/power'); powerData = await r.json(); renderPower(); } catch(e) { console.error(e); }
+}
+function renderPower() {
+  const el = document.getElementById('page-power');
+  if (!powerData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = powerData;
+  const fs = d.fleet_summary || {};
+
+  // Fleet power summary
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Fleet Power Summary</h3>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4">';
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Current Draw</div><div class="text-lg font-bold text-white">${fs.total_current_kw||0} kW</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Monthly kWh</div><div class="text-lg font-bold text-gray-300">${(fs.monthly_kwh||0).toLocaleString()}</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Est. Power Cost/mo</div><div class="text-lg font-bold text-amber-400">$${(fs.power_cost_estimate||0).toLocaleString()}</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Power % of GPU Cost</div><div class="text-lg font-bold text-gray-300">${fs.power_as_pct_of_cost||0}%</div></div>`;
+  html += '</div></div>';
+
+  // Per-server power details
+  for (const [sk, ps] of Object.entries(d.per_server || {})) {
+    if (ps.no_data) continue;
+    html += `<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">${ps.server_name} — Power Profile</h3>`;
+    html += '<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">';
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Current</div><div class="text-white font-bold">${ps.current_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Peak</div><div class="text-red-400 font-bold">${ps.peak_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Min</div><div class="text-emerald-400 font-bold">${ps.min_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Per GPU</div><div class="text-gray-300 font-bold">${ps.power_per_gpu_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Tokens/kWh</div><div class="text-cyan-400 font-bold">${(ps.tokens_per_kwh||0).toLocaleString()}</div></div>`;
+    html += '</div>';
+
+    // Efficiency curve
+    const ec = ps.efficiency_curve || [];
+    if (ec.length > 0) {
+      html += '<div class="text-xs text-gray-400 mb-2 font-medium">Power vs Utilization Curve</div>';
+      const maxPow = Math.max(...ec.map(e=>e.avg_power_w), 1);
+      html += '<div class="space-y-1 mb-4">';
+      for (const e of ec) {
+        const barW = e.avg_power_w / maxPow * 100;
+        const isOptimal = ps.optimal_point && e.util_bucket === ps.optimal_point.util_bucket;
+        const barC = isOptimal ? 'bg-emerald-500/60' : 'bg-cyan-500/40';
+        html += `<div class="flex items-center gap-2 text-[10px] ${isOptimal ? 'border-l-2 border-emerald-400 pl-1' : ''}">`;
+        html += `<span class="text-gray-500 w-14">${e.util_bucket}-${e.util_bucket+9}%</span>`;
+        html += `<div class="flex-1 h-4 rounded bg-gray-800"><div class="${barC} h-4 rounded" style="width:${barW}%"></div></div>`;
+        html += `<span class="text-gray-400 w-32 text-right">${e.avg_power_w}W | ${e.avg_temp_c}C | eff:${e.efficiency}</span>`;
+        if (isOptimal) html += '<span class="text-emerald-400 text-[9px] font-bold">OPTIMAL</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Per-GPU power
+    const pg = ps.per_gpu || [];
+    if (pg.length > 0) {
+      html += '<div class="text-xs text-gray-400 mb-2 font-medium">Per-GPU Power Distribution</div>';
+      html += '<div class="grid grid-cols-4 md:grid-cols-8 gap-2">';
+      for (const g of pg) {
+        const pc = g.avg_power_w > 300 ? 'text-red-400' : g.avg_power_w > 200 ? 'text-amber-400' : 'text-emerald-400';
+        html += `<div class="glass-bright rounded-lg p-2 text-center text-[10px]"><div class="text-gray-500">GPU ${g.gpu}</div><div class="${pc} font-bold">${g.avg_power_w}W</div><div class="text-gray-500">${g.avg_temp_c}C</div></div>`;
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
 }
 
 // ── Executive Summary Tab ──

@@ -76,6 +76,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('network')" id="tab-network">Network & I/O</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('executive')" id="tab-executive">Executive Summary</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('livecalls')" id="tab-livecalls">Live Calls</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('modelcompare')" id="tab-modelcompare">Model Compare</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('power')" id="tab-power">Power Mgmt</button>
 </div>
 
 <!-- Content -->
@@ -92,6 +95,9 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-quality" class="hidden"></div>
   <div id="page-network" class="hidden"></div>
   <div id="page-executive" class="hidden"></div>
+  <div id="page-livecalls" class="hidden"></div>
+  <div id="page-modelcompare" class="hidden"></div>
+  <div id="page-power" class="hidden"></div>
 </div>
 
 <script>
@@ -115,6 +121,9 @@ let capacityData = null;
 let qualityData = null;
 let networkData = null;
 let executiveData = null;
+let livecallsData = null;
+let modelcompareData = null;
+let powerData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -151,7 +160,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive','livecalls','modelcompare','power'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -165,6 +174,9 @@ function switchTab(tab) {
   if (tab === 'quality') loadQuality();
   if (tab === 'network') loadNetwork();
   if (tab === 'executive') loadExecutive();
+  if (tab === 'livecalls') loadLiveCalls();
+  if (tab === 'modelcompare') loadModelCompare();
+  if (tab === 'power') loadPower();
 }
 
 // ── Overview Tab ──
@@ -1585,6 +1597,213 @@ function renderAll() {
   else if (activeTab === 'quality') renderQuality();
   else if (activeTab === 'network') renderNetwork();
   else if (activeTab === 'executive') renderExecutive();
+  else if (activeTab === 'livecalls') renderLiveCalls();
+  else if (activeTab === 'modelcompare') renderModelCompare();
+  else if (activeTab === 'power') renderPower();
+}
+
+// ── Live Calls Tab ──
+async function loadLiveCalls() {
+  try { const r = await fetch('/api/gpu?endpoint=livecalls'); livecallsData = await r.json(); renderLiveCalls(); } catch(e) { console.error(e); }
+}
+function renderLiveCalls() {
+  const el = document.getElementById('page-livecalls');
+  if (!livecallsData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = livecallsData;
+  const s = d.summary || {};
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Active Calls Now</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Real-time view of concurrent calls across servers</p>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-emerald-400">${s.total_active_now||0}</div><div class="text-[10px] text-gray-500 mt-1">Active Now</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-cyan-400">${s.peak_concurrent||0}</div><div class="text-[10px] text-gray-500 mt-1">Peak</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-gray-300">${s.avg_concurrent||0}</div><div class="text-[10px] text-gray-500 mt-1">Avg</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-4 text-center"><div class="text-4xl font-bold text-amber-400">${s.zero_call_pct||0}%</div><div class="text-[10px] text-gray-500 mt-1">Idle Time</div></div>`;
+  html += '</div>';
+
+  for (const c of (d.calls||[])) {
+    const utilC = c.current_gpu_util > 80 ? 'text-red-400' : c.current_gpu_util > 50 ? 'text-amber-400' : 'text-emerald-400';
+    html += `<div class="glass-bright rounded-lg p-3 mb-2 flex items-center justify-between">`;
+    html += `<div><span class="text-white text-sm font-medium">${c.server_name}</span>`;
+    html += `<div class="text-[10px] text-gray-500">Running: ${c.requests_running} | Waiting: ${c.requests_waiting} | Connections: ${c.active_connections}</div></div>`;
+    html += `<div class="flex gap-4 text-[10px]">`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-white">${c.active_calls}</div><div class="text-gray-500">Calls</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold ${utilC}">${c.current_gpu_util}%</div><div class="text-gray-500">GPU</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-cyan-400">${c.current_ttft_ms}ms</div><div class="text-gray-500">TTFT</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-gray-300">${c.current_e2e_s}s</div><div class="text-gray-500">E2E</div></div>`;
+    html += `<div class="text-center"><div class="text-lg font-bold text-gray-300">${c.current_kv_cache}%</div><div class="text-gray-500">KV</div></div>`;
+    html += '</div></div>';
+  }
+  html += '</div>';
+
+  const tl = s.timeline || [];
+  if (tl.length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Call Timeline</h3>';
+    html += '<p class="text-xs text-gray-500 mb-4">Concurrent calls over time</p>';
+    const maxC = Math.max(...tl.map(t=>t.calls), 1);
+    html += '<div class="space-y-0.5">';
+    for (const t of tl.slice(-40)) {
+      const time = new Date(t.t * 1000).toLocaleTimeString();
+      const barW = t.calls / maxC * 100;
+      const barC = t.calls > 5 ? 'bg-red-500/60' : t.calls > 2 ? 'bg-amber-500/60' : 'bg-emerald-500/60';
+      html += `<div class="flex items-center gap-1 text-[9px]"><span class="text-gray-600 w-14">${time}</span><span class="text-gray-500 w-4">${t.server[0]}</span>`;
+      html += `<div class="flex-1 h-3 rounded bg-gray-800"><div class="${barC} h-3 rounded" style="width:${barW}%"></div></div>`;
+      html += `<span class="text-gray-400 w-20 text-right">${t.calls}c ${t.gpu_util.toFixed(0)}%</span></div>`;
+    }
+    html += '</div></div>';
+  }
+
+  const dd = d.duration_distribution || {};
+  if (Object.keys(dd).length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Call Duration Distribution</h3>';
+    html += '<div class="grid grid-cols-5 gap-2">';
+    const maxDD = Math.max(...Object.values(dd), 1);
+    for (const [label, count] of Object.entries(dd)) {
+      const pct = count / maxDD * 100;
+      html += `<div class="text-center"><div class="h-20 flex items-end justify-center mb-1"><div class="w-8 rounded-t bg-cyan-500/50" style="height:${pct}%"></div></div>`;
+      html += `<div class="text-[10px] text-gray-400">${label}</div><div class="text-[10px] text-white font-medium">${count}</div></div>`;
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Model Compare Tab ──
+async function loadModelCompare() {
+  try { const r = await fetch('/api/gpu?endpoint=modelcompare'); modelcompareData = await r.json(); renderModelCompare(); } catch(e) { console.error(e); }
+}
+function renderModelCompare() {
+  const el = document.getElementById('page-modelcompare');
+  if (!modelcompareData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = modelcompareData;
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Active Models</h3>';
+  html += '<p class="text-xs text-gray-500 mb-4">Currently loaded vLLM models and their metrics</p>';
+  if ((d.models||[]).length === 0) {
+    html += '<div class="text-gray-500 text-sm">No vLLM models detected.</div>';
+  } else {
+    html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const m of d.models) {
+      html += `<div class="glass-bright rounded-lg p-4">`;
+      html += `<div class="flex justify-between items-center mb-2"><span class="text-white text-sm font-medium">${m.model_name}</span><span class="text-[10px] text-gray-500">${m.server_name} :${m.port}</span></div>`;
+      html += '<div class="grid grid-cols-3 gap-2 text-[10px]">';
+      html += `<div><span class="text-gray-500">TTFT</span><div class="${m.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400'} font-medium">${m.avg_ttft_ms}ms</div></div>`;
+      html += `<div><span class="text-gray-500">ITL</span><div class="text-gray-300 font-medium">${m.avg_itl_ms}ms</div></div>`;
+      html += `<div><span class="text-gray-500">E2E</span><div class="${m.avg_e2e_s > 3 ? 'text-amber-400' : 'text-emerald-400'} font-medium">${m.avg_e2e_s}s</div></div>`;
+      html += `<div><span class="text-gray-500">Queue</span><div class="text-gray-300 font-medium">${m.avg_queue_s}s</div></div>`;
+      html += `<div><span class="text-gray-500">KV Cache</span><div class="${m.kv_cache_usage > 80 ? 'text-red-400' : 'text-emerald-400'} font-medium">${m.kv_cache_usage}%</div></div>`;
+      html += `<div><span class="text-gray-500">Cache Hit</span><div class="text-cyan-400 font-medium">${m.cache_hit_rate}%</div></div>`;
+      html += `<div><span class="text-gray-500">Running</span><div class="text-white font-medium">${m.requests_running}</div></div>`;
+      html += `<div><span class="text-gray-500">Total Reqs</span><div class="text-white font-medium">${(m.total_requests||0).toLocaleString()}</div></div>`;
+      html += '</div></div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  for (const tw of (d.time_windows||[])) {
+    html += `<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">${tw.server_name} — Performance Over Time</h3>`;
+    html += '<p class="text-xs text-gray-500 mb-4">Data split into quarters to detect changes</p>';
+    html += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+    html += '<thead><tr class="text-gray-500 border-b border-gray-800"><th class="text-left py-2 px-2">Window</th><th class="text-right py-2 px-2">TTFT</th><th class="text-right py-2 px-2">E2E</th><th class="text-right py-2 px-2">GPU Util</th><th class="text-right py-2 px-2">KV Cache</th><th class="text-right py-2 px-2">Avg Calls</th><th class="text-right py-2 px-2">Peak</th><th class="text-right py-2 px-2">Samples</th></tr></thead><tbody>';
+    for (const w of (tw.windows||[])) {
+      const isLatest = w.label.includes('latest');
+      const rowClass = isLatest ? 'bg-emerald-500/10' : '';
+      html += `<tr class="border-b border-gray-800/50 ${rowClass}">`;
+      html += `<td class="py-2 px-2 text-white font-medium">${w.label}</td>`;
+      html += `<td class="py-2 px-2 text-right ${w.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-gray-300'}">${w.avg_ttft_ms}ms</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_e2e_s}s</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_util}%</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_kv}%</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.avg_calls}</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-300">${w.peak_calls}</td>`;
+      html += `<td class="py-2 px-2 text-right text-gray-500">${w.samples}</td>`;
+      html += '</tr>';
+    }
+    html += '</tbody></table></div></div>';
+  }
+
+  const comp = d.comparison || {};
+  if (Object.keys(comp).length > 0) {
+    html += '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Token Efficiency Comparison</h3>';
+    html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+    for (const [sk, c] of Object.entries(comp)) {
+      html += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-2">${c.server_name}</div>`;
+      html += `<div class="grid grid-cols-3 gap-2 text-[10px]">`;
+      html += `<div><span class="text-gray-500">Total Tokens</span><div class="text-white font-medium">${(c.total_tokens_processed||0).toLocaleString()}</div></div>`;
+      html += `<div><span class="text-gray-500">Avg Power</span><div class="text-gray-300 font-medium">${c.avg_power_w}W</div></div>`;
+      html += `<div><span class="text-gray-500">Tokens/Wh</span><div class="text-cyan-400 font-medium">${c.tokens_per_watt_hour}</div></div>`;
+      html += '</div></div>';
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Power Management Tab ──
+async function loadPower() {
+  try { const r = await fetch('/api/gpu?endpoint=power'); powerData = await r.json(); renderPower(); } catch(e) { console.error(e); }
+}
+function renderPower() {
+  const el = document.getElementById('page-power');
+  if (!powerData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading...</div>'; return; }
+  const d = powerData;
+  const fs = d.fleet_summary || {};
+
+  let html = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Fleet Power Summary</h3>';
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4">';
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Current Draw</div><div class="text-lg font-bold text-white">${fs.total_current_kw||0} kW</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Monthly kWh</div><div class="text-lg font-bold text-gray-300">${(fs.monthly_kwh||0).toLocaleString()}</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Est. Power Cost/mo</div><div class="text-lg font-bold text-amber-400">$${(fs.power_cost_estimate||0).toLocaleString()}</div></div>`;
+  html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Power % of GPU Cost</div><div class="text-lg font-bold text-gray-300">${fs.power_as_pct_of_cost||0}%</div></div>`;
+  html += '</div></div>';
+
+  for (const [sk, ps] of Object.entries(d.per_server || {})) {
+    if (ps.no_data) continue;
+    html += `<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">${ps.server_name} — Power Profile</h3>`;
+    html += '<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">';
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Current</div><div class="text-white font-bold">${ps.current_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Peak</div><div class="text-red-400 font-bold">${ps.peak_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Min</div><div class="text-emerald-400 font-bold">${ps.min_power_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Per GPU</div><div class="text-gray-300 font-bold">${ps.power_per_gpu_w}W</div></div>`;
+    html += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Tokens/kWh</div><div class="text-cyan-400 font-bold">${(ps.tokens_per_kwh||0).toLocaleString()}</div></div>`;
+    html += '</div>';
+
+    const ec = ps.efficiency_curve || [];
+    if (ec.length > 0) {
+      html += '<div class="text-xs text-gray-400 mb-2 font-medium">Power vs Utilization Curve</div>';
+      const maxPow = Math.max(...ec.map(e=>e.avg_power_w), 1);
+      html += '<div class="space-y-1 mb-4">';
+      for (const e of ec) {
+        const barW = e.avg_power_w / maxPow * 100;
+        const isOptimal = ps.optimal_point && e.util_bucket === ps.optimal_point.util_bucket;
+        const barC = isOptimal ? 'bg-emerald-500/60' : 'bg-cyan-500/40';
+        html += `<div class="flex items-center gap-2 text-[10px] ${isOptimal ? 'border-l-2 border-emerald-400 pl-1' : ''}">`;
+        html += `<span class="text-gray-500 w-14">${e.util_bucket}-${e.util_bucket+9}%</span>`;
+        html += `<div class="flex-1 h-4 rounded bg-gray-800"><div class="${barC} h-4 rounded" style="width:${barW}%"></div></div>`;
+        html += `<span class="text-gray-400 w-32 text-right">${e.avg_power_w}W | ${e.avg_temp_c}C | eff:${e.efficiency}</span>`;
+        if (isOptimal) html += '<span class="text-emerald-400 text-[9px] font-bold">OPTIMAL</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    const pg = ps.per_gpu || [];
+    if (pg.length > 0) {
+      html += '<div class="text-xs text-gray-400 mb-2 font-medium">Per-GPU Power Distribution</div>';
+      html += '<div class="grid grid-cols-4 md:grid-cols-8 gap-2">';
+      for (const g of pg) {
+        const pc = g.avg_power_w > 300 ? 'text-red-400' : g.avg_power_w > 200 ? 'text-amber-400' : 'text-emerald-400';
+        html += `<div class="glass-bright rounded-lg p-2 text-center text-[10px]"><div class="text-gray-500">GPU ${g.gpu}</div><div class="${pc} font-bold">${g.avg_power_w}W</div><div class="text-gray-500">${g.avg_temp_c}C</div></div>`;
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
 }
 
 // ── Executive Summary Tab ──

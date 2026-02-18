@@ -58,6 +58,24 @@ history = {k: deque(maxlen=MAX_HISTORY) for k in SERVERS}
 hourly_stats = {k: {} for k in SERVERS}
 HOURLY_RETENTION = 25  # keep 25 hours to cover full 24h window
 
+# ── Proactive Alerting Stores ─────────────────────────────────
+# Error tracking: {server: deque of {t, errors, total, rate}}
+error_history = {k: deque(maxlen=MAX_HISTORY) for k in SERVERS}
+# Zombie/memory tracking: deque of {t, zombies, gunicorn_rss_mb, gunicorn_workers, voicemail_workers}
+process_health_history = deque(maxlen=MAX_HISTORY)
+# Service uptime tracking: {service_name: {status, last_change_t, uptime_samples, total_samples, incidents: []}}
+service_uptime = {}
+# SSH/fetch error log: deque of {t, server, endpoint, error}
+fetch_errors = deque(maxlen=200)
+# Inter-cluster latency tracking: deque of {t, rtt_ms}
+cluster_latency = deque(maxlen=MAX_HISTORY)
+# Disk usage tracking: {server: deque of {t, used_bytes, total_bytes, pct}}
+disk_history = {k: deque(maxlen=480) for k in SERVERS}  # ~24h at 3min intervals
+# GPU clock tracking for throttle detection: {server: {gpu_idx: deque of {t, sm_clock, temp}}}
+gpu_clock_history = {k: {} for k in SERVERS}
+# Call volume by hour-of-day for forecasting: {dow_hour: [call_counts]}
+call_volume_patterns = {}
+
 
 # ── Command Helpers ────────────────────────────────────────────
 async def run_local_command(command: str) -> str:
@@ -540,6 +558,51 @@ async def fetch_gpu_data(server_key: str) -> dict:
     h["_net_rx_end"] = net_rx
     h["_net_tx_end"] = net_tx
 
+    # ── Proactive Alert Tracking ──
+    # Error rate tracking (vLLM errors = total_requests - success_count)
+    total_errors = 0
+    total_reqs = 0
+    for v in vllm_services:
+        t = v.get("total_requests", 0)
+        s = v.get("success_count", 0)
+        total_reqs += t
+        total_errors += max(0, t - s)
+    error_history[server_key].append({
+        "t": now, "errors": total_errors, "total": total_reqs,
+        "rate": round(total_errors / max(total_reqs, 1) * 100, 2),
+    })
+
+    # Disk usage tracking (every ~20 samples = ~1 min)
+    if len(history[server_key]) % 20 == 0 and disk:
+        disk_history[server_key].append({
+            "t": now,
+            "used_bytes": disk.get("used", 0),
+            "total_bytes": disk.get("total", 0),
+            "pct": round(disk.get("used", 0) / max(disk.get("total", 1), 1) * 100, 1),
+        })
+
+    # GPU clock tracking for throttle detection
+    for g in gpus:
+        idx = g["index"]
+        if idx not in gpu_clock_history[server_key]:
+            gpu_clock_history[server_key][idx] = deque(maxlen=120)
+        gpu_clock_history[server_key][idx].append({
+            "t": now, "sm_clock": g.get("gpu_util", 0),
+            "temp": g.get("temp", 0), "power": g.get("power_draw", 0),
+            "mem_util": g.get("mem_util", 0),
+        })
+
+    # Call volume pattern tracking (for forecasting)
+    from datetime import datetime, timezone
+    dt_now = datetime.fromtimestamp(now, tz=timezone.utc)
+    dow_hour_key = f"{dt_now.weekday()}_{dt_now.hour}"
+    if dow_hour_key not in call_volume_patterns:
+        call_volume_patterns[dow_hour_key] = []
+    call_volume_patterns[dow_hour_key].append(calls)
+    # Keep last 200 per slot
+    if len(call_volume_patterns[dow_hour_key]) > 200:
+        call_volume_patterns[dow_hour_key] = call_volume_patterns[dow_hour_key][-200:]
+
     return data
 
 
@@ -547,9 +610,354 @@ async def fetch_gpu_data(server_key: str) -> dict:
 @app.get("/api/agent")
 async def get_agent_status():
     try:
-        return await asyncio.wait_for(fetch_agent_status(), timeout=15)
+        result = await asyncio.wait_for(fetch_agent_status(), timeout=15)
+        # Track process health (zombies, memory, workers)
+        now = time.time()
+        process_health_history.append({
+            "t": now,
+            "zombies": result.get("zombie_processes", 0),
+            "gunicorn_rss_mb": result.get("gunicorn_memory_mb", 0),
+            "gunicorn_workers": result.get("gunicorn_workers", 0),
+            "voicemail_workers": result.get("voicemail_workers", 0),
+            "active_bots": result.get("active_bots", 0),
+            "tcp_connections": result.get("tcp_connections", 0),
+        })
+        # Track service uptime
+        for svc in result.get("services", []):
+            name = svc["name"]
+            status = svc["status"]
+            if name not in service_uptime:
+                service_uptime[name] = {"status": status, "last_change_t": now, "up_samples": 0, "total_samples": 0, "incidents": deque(maxlen=50)}
+            su = service_uptime[name]
+            su["total_samples"] += 1
+            if status == "active":
+                su["up_samples"] += 1
+            if status != su["status"]:
+                su["incidents"].append({"t": now, "from": su["status"], "to": status})
+                su["status"] = status
+                su["last_change_t"] = now
+        return result
     except Exception as e:
         return {"error": str(e), "status": "offline"}
+
+
+@app.get("/api/proactive")
+async def get_proactive_alerts():
+    now = time.time()
+    result = {
+        "predictive_alerts": [],
+        "error_rates": {},
+        "process_health": {},
+        "service_uptime": {},
+        "cluster_latency": {},
+        "thermal_throttling": {},
+        "call_forecast": {},
+        "disk_trends": {},
+    }
+
+    # ── 1. Trend-Based Predictive Alerts ──
+    predictions = []
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if len(sk_hist) < 10:
+            continue
+        recent = sk_hist[-60:]  # last ~60 samples
+
+        # KV Cache trend prediction
+        kv_vals = [p.get("kv_cache", 0) for p in recent if p.get("kv_cache", 0) > 0]
+        if len(kv_vals) >= 5:
+            kv_rate = (kv_vals[-1] - kv_vals[0]) / max(len(kv_vals), 1)  # change per sample
+            if kv_rate > 0 and kv_vals[-1] < 90:
+                samples_to_90 = (90 - kv_vals[-1]) / kv_rate
+                hours_to_90 = samples_to_90 * 3 / 3600  # 3s per sample
+                if hours_to_90 < 24:
+                    predictions.append({
+                        "server": sk, "metric": "KV Cache", "current": round(kv_vals[-1], 1),
+                        "threshold": 90, "eta_hours": round(hours_to_90, 1),
+                        "severity": "critical" if hours_to_90 < 2 else "warning",
+                        "message": f"KV Cache at {kv_vals[-1]:.1f}%, will hit 90% in ~{hours_to_90:.1f}h",
+                    })
+
+        # VRAM trend prediction
+        vram_vals = [p.get("vram_pct", 0) for p in recent]
+        if len(vram_vals) >= 5:
+            vram_rate = (vram_vals[-1] - vram_vals[0]) / max(len(vram_vals), 1)
+            if vram_rate > 0 and vram_vals[-1] < 95:
+                samples_to_95 = (95 - vram_vals[-1]) / vram_rate
+                hours_to_95 = samples_to_95 * 3 / 3600
+                if hours_to_95 < 24:
+                    predictions.append({
+                        "server": sk, "metric": "VRAM", "current": round(vram_vals[-1], 1),
+                        "threshold": 95, "eta_hours": round(hours_to_95, 1),
+                        "severity": "critical" if hours_to_95 < 2 else "warning",
+                        "message": f"VRAM at {vram_vals[-1]:.1f}%, will hit 95% in ~{hours_to_95:.1f}h",
+                    })
+
+        # GPU util trend (predicting saturation)
+        util_vals = [p.get("avg_util", 0) for p in recent]
+        if len(util_vals) >= 5:
+            util_rate = (util_vals[-1] - util_vals[0]) / max(len(util_vals), 1)
+            if util_rate > 0 and util_vals[-1] < 95:
+                samples_to_95 = (95 - util_vals[-1]) / util_rate
+                hours_to_95 = samples_to_95 * 3 / 3600
+                if hours_to_95 < 12:
+                    predictions.append({
+                        "server": sk, "metric": "GPU Utilization", "current": round(util_vals[-1], 1),
+                        "threshold": 95, "eta_hours": round(hours_to_95, 1),
+                        "severity": "warning",
+                        "message": f"GPU util at {util_vals[-1]:.1f}%, may hit 95% in ~{hours_to_95:.1f}h",
+                    })
+
+        # Temperature trend
+        temp_vals = [p.get("max_temp", 0) for p in recent]
+        if len(temp_vals) >= 5:
+            temp_rate = (temp_vals[-1] - temp_vals[0]) / max(len(temp_vals), 1)
+            if temp_rate > 0 and temp_vals[-1] < 85:
+                samples_to_85 = (85 - temp_vals[-1]) / temp_rate
+                hours_to_85 = samples_to_85 * 3 / 3600
+                if hours_to_85 < 6:
+                    predictions.append({
+                        "server": sk, "metric": "Temperature", "current": round(temp_vals[-1], 1),
+                        "threshold": 85, "eta_hours": round(hours_to_85, 1),
+                        "severity": "warning",
+                        "message": f"Temp at {temp_vals[-1]}°C, rising toward 85°C in ~{hours_to_85:.1f}h",
+                    })
+
+    # Disk prediction
+    for sk in SERVERS:
+        dh = list(disk_history[sk])
+        if len(dh) >= 3:
+            disk_rate = (dh[-1]["pct"] - dh[0]["pct"]) / max(len(dh), 1)
+            if disk_rate > 0 and dh[-1]["pct"] < 90:
+                samples_to_90 = (90 - dh[-1]["pct"]) / disk_rate
+                # disk tracked every ~20 samples (~1 min each)
+                hours_to_90 = samples_to_90 * 60 / 3600
+                days_to_90 = hours_to_90 / 24
+                if days_to_90 < 30:
+                    predictions.append({
+                        "server": sk, "metric": "Disk Space", "current": dh[-1]["pct"],
+                        "threshold": 90, "eta_hours": round(hours_to_90, 1),
+                        "severity": "critical" if days_to_90 < 3 else "warning",
+                        "message": f"Disk at {dh[-1]['pct']}%, will hit 90% in ~{days_to_90:.1f} days",
+                    })
+
+    # Zombie growth prediction
+    ph = list(process_health_history)
+    if len(ph) >= 5:
+        zombie_vals = [p["zombies"] for p in ph]
+        z_rate = (zombie_vals[-1] - zombie_vals[0]) / max(len(zombie_vals), 1)
+        if z_rate > 0.01:  # growing
+            predictions.append({
+                "server": "rtx5090", "metric": "Zombie Processes",
+                "current": zombie_vals[-1], "threshold": 100,
+                "eta_hours": round((100 - zombie_vals[-1]) / z_rate * 3 / 3600, 1) if zombie_vals[-1] < 100 else 0,
+                "severity": "warning",
+                "message": f"Zombies at {zombie_vals[-1]}, growing at {z_rate*20:.1f}/min — may need restart",
+            })
+        if zombie_vals[-1] >= 50:
+            predictions.append({
+                "server": "rtx5090", "metric": "Zombie Processes",
+                "current": zombie_vals[-1], "threshold": 50,
+                "eta_hours": 0, "severity": "critical",
+                "message": f"{zombie_vals[-1]} zombie processes — consider restarting services",
+            })
+
+    result["predictive_alerts"] = sorted(predictions, key=lambda x: x.get("eta_hours", 999))
+
+    # ── 2. Error Rate Tracker ──
+    for sk in SERVERS:
+        eh = list(error_history[sk])
+        if not eh:
+            continue
+        recent_errors = eh[-60:]  # last 60 samples
+        current_errors = recent_errors[-1]["errors"] if recent_errors else 0
+        current_total = recent_errors[-1]["total"] if recent_errors else 0
+        current_rate = recent_errors[-1]["rate"] if recent_errors else 0
+
+        # Compute delta (errors in this window vs start of window)
+        if len(recent_errors) >= 2:
+            err_delta = recent_errors[-1]["errors"] - recent_errors[0]["errors"]
+            req_delta = recent_errors[-1]["total"] - recent_errors[0]["total"]
+            window_rate = round(err_delta / max(req_delta, 1) * 100, 2) if req_delta > 0 else 0
+        else:
+            err_delta = 0
+            req_delta = 0
+            window_rate = 0
+
+        error_sparkline = [e["errors"] for e in recent_errors]
+        result["error_rates"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "total_errors": current_errors,
+            "total_requests": current_total,
+            "cumulative_rate": current_rate,
+            "window_errors": err_delta,
+            "window_requests": req_delta,
+            "window_rate": window_rate,
+            "sparkline": error_sparkline[-30:],
+            "status": "critical" if window_rate > 5 else "warning" if window_rate > 1 else "healthy",
+        }
+
+    # ── 3. Zombie & Memory Leak Monitor ──
+    if ph:
+        zombie_spark = [p["zombies"] for p in ph[-60:]]
+        rss_spark = [p["gunicorn_rss_mb"] for p in ph[-60:]]
+        worker_spark = [p["gunicorn_workers"] for p in ph[-60:]]
+        bot_spark = [p["active_bots"] for p in ph[-60:]]
+
+        # Detect memory leak (RSS growing consistently)
+        rss_growing = False
+        if len(rss_spark) >= 10:
+            first_half = sum(rss_spark[:len(rss_spark)//2]) / max(len(rss_spark)//2, 1)
+            second_half = sum(rss_spark[len(rss_spark)//2:]) / max(len(rss_spark) - len(rss_spark)//2, 1)
+            rss_growing = second_half > first_half * 1.05  # 5% growth
+
+        result["process_health"] = {
+            "current_zombies": ph[-1]["zombies"],
+            "zombie_trend": zombie_spark,
+            "gunicorn_rss_mb": ph[-1]["gunicorn_rss_mb"],
+            "rss_trend": rss_spark,
+            "rss_leak_detected": rss_growing,
+            "gunicorn_workers": ph[-1]["gunicorn_workers"],
+            "worker_trend": worker_spark,
+            "voicemail_workers": ph[-1]["voicemail_workers"],
+            "active_bots": ph[-1]["active_bots"],
+            "bot_trend": bot_spark,
+            "samples": len(ph),
+        }
+
+    # ── 4. Service Downtime Log ──
+    for name, su in service_uptime.items():
+        uptime_pct = round(su["up_samples"] / max(su["total_samples"], 1) * 100, 3)
+        incidents = [{"t": i["t"], "from": i["from"], "to": i["to"],
+                      "time_ago": f"{(now - i['t'])/60:.0f}m ago"} for i in su["incidents"]]
+        result["service_uptime"][name] = {
+            "status": su["status"],
+            "uptime_pct": uptime_pct,
+            "total_samples": su["total_samples"],
+            "last_change_t": su["last_change_t"],
+            "last_change_ago": f"{(now - su['last_change_t'])/60:.0f}m ago",
+            "incidents": incidents[-10:],  # last 10
+        }
+
+    # ── 5. Inter-Cluster Latency ──
+    # Measure RTX5090 → H200 round-trip by timing a lightweight SSH command
+    try:
+        rtx_server = SERVERS["rtx5090"]
+        t0 = time.time()
+        await run_command(rtx_server, f"curl -s -o /dev/null -w '%{{time_total}}' http://146.88.194.12:8001/health --max-time 5")
+        rtt = (time.time() - t0) * 1000
+        cluster_latency.append({"t": now, "rtt_ms": round(rtt, 1)})
+    except Exception:
+        pass
+
+    lat_data = list(cluster_latency)
+    if lat_data:
+        rtts = [l["rtt_ms"] for l in lat_data[-30:]]
+        result["cluster_latency"] = {
+            "current_rtt_ms": rtts[-1] if rtts else 0,
+            "avg_rtt_ms": round(sum(rtts) / len(rtts), 1),
+            "max_rtt_ms": round(max(rtts), 1),
+            "min_rtt_ms": round(min(rtts), 1),
+            "trend": rtts,
+            "status": "critical" if rtts[-1] > 3000 else "warning" if rtts[-1] > 1500 else "healthy",
+        }
+
+    # ── 6. GPU Thermal Throttling Detection ──
+    for sk in SERVERS:
+        throttle_gpus = []
+        for idx, clock_deque in gpu_clock_history[sk].items():
+            clocks = list(clock_deque)
+            if len(clocks) < 5:
+                continue
+            temps = [c["temp"] for c in clocks[-20:]]
+            powers = [c["power"] for c in clocks[-20:]]
+            avg_temp = sum(temps) / len(temps)
+            max_temp_gpu = max(temps)
+            # Detect throttling: high temp + reduced power relative to peak
+            peak_power = max(powers) if powers else 0
+            current_power = powers[-1] if powers else 0
+            power_drop_pct = round((1 - current_power / max(peak_power, 1)) * 100, 1) if peak_power > 0 else 0
+
+            if max_temp_gpu >= 80 or (power_drop_pct > 15 and avg_temp > 70):
+                throttle_gpus.append({
+                    "gpu": idx,
+                    "current_temp": temps[-1],
+                    "avg_temp": round(avg_temp, 1),
+                    "peak_temp": max_temp_gpu,
+                    "current_power": current_power,
+                    "peak_power": peak_power,
+                    "power_drop_pct": power_drop_pct,
+                    "likely_throttling": max_temp_gpu >= 83 or power_drop_pct > 20,
+                })
+
+        if throttle_gpus:
+            result["thermal_throttling"][sk] = {
+                "server_name": SERVERS[sk]["name"],
+                "gpus": throttle_gpus,
+                "any_throttling": any(g["likely_throttling"] for g in throttle_gpus),
+            }
+
+    # ── 7. Call Volume Forecasting ──
+    from datetime import datetime, timezone
+    dt_now = datetime.fromtimestamp(now, tz=timezone.utc)
+    current_dow = dt_now.weekday()
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    forecast_hours = []
+    for h in range(24):
+        key = f"{current_dow}_{h}"
+        samples = call_volume_patterns.get(key, [])
+        if samples:
+            avg_calls = sum(samples) / len(samples)
+            peak_calls = max(samples)
+        else:
+            avg_calls = 0
+            peak_calls = 0
+        forecast_hours.append({
+            "hour": h,
+            "label": f"{h:02d}:00",
+            "avg_calls": round(avg_calls, 1),
+            "peak_calls": peak_calls,
+            "samples": len(samples),
+            "is_current": h == dt_now.hour,
+        })
+
+    result["call_forecast"] = {
+        "day": day_names[current_dow],
+        "current_hour": dt_now.hour,
+        "hours": forecast_hours,
+        "peak_hour": max(forecast_hours, key=lambda x: x["avg_calls"]) if forecast_hours else None,
+    }
+
+    # ── 8. Disk & Log Growth ──
+    for sk in SERVERS:
+        dh = list(disk_history[sk])
+        if not dh:
+            continue
+        current = dh[-1]
+        growth_rate_pct_per_day = 0
+        days_until_full = None
+        if len(dh) >= 2:
+            time_span_hours = (dh[-1]["t"] - dh[0]["t"]) / 3600
+            pct_change = dh[-1]["pct"] - dh[0]["pct"]
+            if time_span_hours > 0:
+                growth_rate_pct_per_day = round(pct_change / time_span_hours * 24, 2)
+                if growth_rate_pct_per_day > 0:
+                    remaining = 100 - current["pct"]
+                    days_until_full = round(remaining / growth_rate_pct_per_day, 1)
+
+        result["disk_trends"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "current_pct": current["pct"],
+            "used_bytes": current["used_bytes"],
+            "total_bytes": current["total_bytes"],
+            "growth_rate_pct_per_day": growth_rate_pct_per_day,
+            "days_until_full": days_until_full,
+            "trend": [d["pct"] for d in dh[-30:]],
+            "status": "critical" if current["pct"] >= 90 else "warning" if current["pct"] >= 80 else "healthy",
+        }
+
+    return result
 
 
 # ── Cost & Analytics Config ───────────────────────────────────
@@ -1311,6 +1719,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('daily')" id="tab-daily">24h Report</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
 </div>
 
 <!-- Content -->
@@ -1322,6 +1731,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-daily" class="hidden"></div>
   <div id="page-agent" class="hidden"></div>
   <div id="page-analytics" class="hidden"></div>
+  <div id="page-proactive" class="hidden"></div>
 </div>
 
 <script>
@@ -1340,6 +1750,7 @@ let dailyLoaded = false;
 let agentData = null;
 let analyticsData = null;
 let analyticsLoaded = false;
+let proactiveData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -1376,7 +1787,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -1385,6 +1796,7 @@ function switchTab(tab) {
   if (tab === 'daily' && !dailyLoaded) loadDaily();
   if (tab === 'agent') loadAgent();
   if (tab === 'analytics') loadAnalytics();
+  if (tab === 'proactive') loadProactive();
 }
 
 // ── Overview Tab ──
@@ -2571,6 +2983,374 @@ function renderAnalytics() {
   el.innerHTML = costHTML + cqHTML + bnHTML + hdHTML + qsHTML + alHTML + efHTML;
 }
 
+// ── Proactive Alerts & Ops Tab ──
+async function loadProactive() {
+  const el = document.getElementById('page-proactive');
+  if (!proactiveData) el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading proactive alerts...</div>';
+  try {
+    const r = await fetch('/api/proactive');
+    proactiveData = await r.json();
+  } catch(e) {
+    proactiveData = { error: e.message };
+  }
+  renderProactive();
+}
+
+function renderProactive() {
+  const el = document.getElementById('page-proactive');
+  const d = proactiveData;
+  if (!d || d.error) {
+    el.innerHTML = `<div class="glass rounded-2xl p-6"><h3 class="text-lg font-semibold text-white">Proactive Alerts</h3><p class="text-red-400 text-sm mt-2">${d?.error||'Failed to load'}</p></div>`;
+    return;
+  }
+
+  // ── 1. Predictive Alerts ──
+  const pa = d.predictive_alerts || [];
+  let paHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 to-orange-600 flex items-center justify-center">
+          <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold text-white">Predictive Alerts</h3>
+          <p class="text-[11px] text-gray-500">Trend-based predictions — issues before they happen</p>
+        </div>
+      </div>
+      <button onclick="loadProactive()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
+    </div>`;
+
+  if (pa.length === 0) {
+    paHTML += '<div class="glass-bright rounded-lg p-4 text-center"><span class="text-emerald-400 text-sm font-medium">No predicted issues — all trends look healthy</span></div>';
+  } else {
+    paHTML += '<div class="space-y-2">';
+    for (const a of pa) {
+      const isCrit = a.severity === 'critical';
+      paHTML += `<div class="glass-bright rounded-lg p-3 ${isCrit?'border-l-2 border-red-500':'border-l-2 border-amber-500'}">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full ${isCrit?'bg-red-500 status-offline':'bg-amber-500'}"></span>
+            <div>
+              <span class="text-xs font-medium text-white">${a.metric}</span>
+              <span class="text-[10px] text-gray-500 ml-2">${a.server}</span>
+            </div>
+          </div>
+          <div class="flex items-center gap-3">
+            <span class="text-[10px] text-gray-400">Current: <span class="text-white font-medium">${a.current}</span></span>
+            <span class="text-[10px] text-gray-400">Threshold: <span class="text-white font-medium">${a.threshold}</span></span>
+            ${a.eta_hours > 0 ? `<span class="text-[10px] px-2 py-0.5 rounded-full ${isCrit?'bg-red-500/20 text-red-400':'bg-amber-500/20 text-amber-400'}">ETA: ${a.eta_hours < 1 ? (a.eta_hours*60).toFixed(0)+'m' : a.eta_hours.toFixed(1)+'h'}</span>` : ''}
+          </div>
+        </div>
+        <div class="text-[11px] text-gray-400 mt-1.5 ml-5">${a.message}</div>
+      </div>`;
+    }
+    paHTML += '</div>';
+  }
+  paHTML += '</div>';
+
+  // ── 2. Error Rate Tracker ──
+  const er = d.error_rates || {};
+  let erHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-rose-500 to-pink-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Error Rate Tracker</h3>
+        <p class="text-[11px] text-gray-500">vLLM request failures and error trends</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+
+  for (const [sk, e] of Object.entries(er)) {
+    const statusColor = e.status === 'critical' ? 'text-red-400' : e.status === 'warning' ? 'text-amber-400' : 'text-emerald-400';
+    const statusBg = e.status === 'critical' ? 'bg-red-500/20' : e.status === 'warning' ? 'bg-amber-500/20' : 'bg-emerald-500/20';
+    erHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-sm font-semibold text-white">${e.server_name}</span>
+        <span class="text-[10px] px-2 py-0.5 rounded-full ${statusBg} ${statusColor}">${e.status}</span>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Window Errors</div>
+          <div class="text-base font-bold ${e.window_errors>0?'text-red-400':'text-emerald-400'}">${e.window_errors}</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Window Rate</div>
+          <div class="text-base font-bold ${statusColor}">${e.window_rate}%</div>
+        </div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center">
+          <div class="text-[9px] text-gray-500 uppercase">Total Requests</div>
+          <div class="text-base font-bold text-white">${fmt(e.total_requests)}</div>
+        </div>
+      </div>
+      <div class="text-[10px] text-gray-500 mb-1">Error count trend</div>
+      ${sparklineSVG(e.sparkline || [], 200, 25, e.status === 'healthy' ? '#22c55e' : '#ef4444')}
+    </div>`;
+  }
+  if (Object.keys(er).length === 0) {
+    erHTML += '<div class="glass-bright rounded-xl p-4 text-gray-500 text-sm col-span-2">Collecting error data...</div>';
+  }
+  erHTML += '</div></div>';
+
+  // ── 3. Process Health Monitor ──
+  const ph = d.process_health || {};
+  let phHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-violet-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Process Health Monitor</h3>
+        <p class="text-[11px] text-gray-500">Zombie processes, memory leaks, worker counts (RTX 5090)</p>
+      </div>
+    </div>`;
+
+  if (ph.samples) {
+    const zombieColor = ph.current_zombies >= 50 ? 'text-red-400' : ph.current_zombies >= 20 ? 'text-amber-400' : 'text-emerald-400';
+    phHTML += `<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Zombies</div>
+        <div class="text-2xl font-bold ${zombieColor}">${ph.current_zombies}</div>
+        <div class="text-[9px] text-gray-500">defunct processes</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Gunicorn RSS</div>
+        <div class="text-2xl font-bold ${ph.rss_leak_detected?'text-red-400':'text-white'}">${(ph.gunicorn_rss_mb/1024).toFixed(1)}G</div>
+        <div class="text-[9px] ${ph.rss_leak_detected?'text-red-400':'text-gray-500'}">${ph.rss_leak_detected?'LEAK DETECTED':'stable'}</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Workers</div>
+        <div class="text-2xl font-bold text-white">${ph.gunicorn_workers}</div>
+        <div class="text-[9px] text-gray-500">gunicorn</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Active Bots</div>
+        <div class="text-2xl font-bold ${ph.active_bots>0?'text-cyan-400':'text-gray-500'}">${ph.active_bots}</div>
+        <div class="text-[9px] text-gray-500">call processes</div>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Zombie Trend</div>
+        ${sparklineSVG(ph.zombie_trend || [], 140, 30, ph.current_zombies >= 50 ? '#ef4444' : '#f59e0b')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Memory (RSS) Trend</div>
+        ${sparklineSVG(ph.rss_trend || [], 140, 30, ph.rss_leak_detected ? '#ef4444' : '#8b5cf6')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Worker Count</div>
+        ${sparklineSVG(ph.worker_trend || [], 140, 30, '#22c55e')}
+      </div>
+      <div class="glass-bright rounded-lg p-3">
+        <div class="text-[10px] text-gray-500 mb-1">Active Bots</div>
+        ${sparklineSVG(ph.bot_trend || [], 140, 30, '#06b6d4')}
+      </div>
+    </div>`;
+  } else {
+    phHTML += '<p class="text-gray-500 text-sm">Visit the Agent tab first to start collecting process health data.</p>';
+  }
+  phHTML += '</div>';
+
+  // ── 4. Service Uptime ──
+  const su = d.service_uptime || {};
+  let suHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Service Uptime</h3>
+        <p class="text-[11px] text-gray-500">Availability tracking and incident history</p>
+      </div>
+    </div>`;
+
+  if (Object.keys(su).length > 0) {
+    suHTML += '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">';
+    for (const [name, s] of Object.entries(su)) {
+      const ok = s.status === 'active';
+      const uptimeColor = s.uptime_pct >= 99.9 ? 'text-emerald-400' : s.uptime_pct >= 99 ? 'text-amber-400' : 'text-red-400';
+      suHTML += `<div class="glass-bright rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full ${ok?'bg-emerald-500':'bg-red-500'}"></span>
+            <span class="text-xs font-medium text-white">${name.replace('agentv2-','')}</span>
+          </div>
+          <span class="text-[10px] px-2 py-0.5 rounded-full ${ok?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}">${ok?'UP':'DOWN'}</span>
+        </div>
+        <div class="flex items-baseline gap-2 mb-2">
+          <span class="text-xl font-bold ${uptimeColor}">${s.uptime_pct}%</span>
+          <span class="text-[10px] text-gray-500">uptime</span>
+        </div>
+        <div class="text-[10px] text-gray-500">Last change: ${s.last_change_ago}</div>
+        ${s.incidents && s.incidents.length > 0 ? `<div class="mt-2 space-y-1">${s.incidents.slice(-3).map(i => `<div class="text-[10px] text-gray-400 flex gap-2"><span class="${i.to==='active'?'text-emerald-400':'text-red-400'}">${i.from} → ${i.to}</span><span class="text-gray-500">${i.time_ago}</span></div>`).join('')}</div>` : ''}
+      </div>`;
+    }
+    suHTML += '</div>';
+  } else {
+    suHTML += '<p class="text-gray-500 text-sm">Visit the Agent tab first to start tracking service uptime.</p>';
+  }
+  suHTML += '</div>';
+
+  // ── 5. Inter-Cluster Latency ──
+  const cl = d.cluster_latency || {};
+  let clHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Inter-Cluster Latency</h3>
+        <p class="text-[11px] text-gray-500">RTX 5090 → H200 round-trip time (LLM/TTS call path)</p>
+      </div>
+    </div>`;
+
+  if (cl.current_rtt_ms) {
+    const latColor = cl.status === 'critical' ? 'text-red-400' : cl.status === 'warning' ? 'text-amber-400' : 'text-emerald-400';
+    clHTML += `<div class="grid grid-cols-4 gap-3 mb-4">
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Current RTT</div>
+        <div class="text-xl font-bold ${latColor}">${cl.current_rtt_ms}ms</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Average</div>
+        <div class="text-xl font-bold text-white">${cl.avg_rtt_ms}ms</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Min</div>
+        <div class="text-xl font-bold text-emerald-400">${cl.min_rtt_ms}ms</div>
+      </div>
+      <div class="glass-bright rounded-lg p-3 text-center">
+        <div class="text-[9px] text-gray-500 uppercase mb-1">Max</div>
+        <div class="text-xl font-bold ${cl.max_rtt_ms>500?'text-red-400':'text-amber-400'}">${cl.max_rtt_ms}ms</div>
+      </div>
+    </div>
+    <div class="glass-bright rounded-lg p-3">
+      <div class="text-[10px] text-gray-500 mb-1">Latency Over Time</div>
+      ${sparklineSVG(cl.trend || [], 400, 40, cl.status === 'healthy' ? '#22c55e' : '#f59e0b')}
+    </div>`;
+  } else {
+    clHTML += '<p class="text-gray-500 text-sm">Measuring inter-cluster latency on next refresh...</p>';
+  }
+  clHTML += '</div>';
+
+  // ── 6. Thermal Throttling ──
+  const tt = d.thermal_throttling || {};
+  let ttHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">GPU Thermal Throttling</h3>
+        <p class="text-[11px] text-gray-500">Detects when GPUs reduce performance due to heat</p>
+      </div>
+    </div>`;
+
+  if (Object.keys(tt).length === 0) {
+    ttHTML += '<div class="glass-bright rounded-lg p-4 text-center"><span class="text-emerald-400 text-sm font-medium">No thermal throttling detected</span></div>';
+  } else {
+    for (const [sk, t] of Object.entries(tt)) {
+      ttHTML += `<div class="glass-bright rounded-xl p-4 mb-3">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-sm font-semibold text-white">${t.server_name}</span>
+          ${t.any_throttling ? '<span class="text-[10px] px-2 py-0.5 rounded-full bg-red-500/20 text-red-400">THROTTLING</span>' : '<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">HIGH TEMP</span>'}
+        </div>
+        <div class="grid grid-cols-4 md:grid-cols-8 gap-2">
+          ${t.gpus.map(g => `<div class="rounded-lg p-2 text-center ${g.likely_throttling?'bg-red-500/10 border border-red-500/20':'bg-amber-500/5 border border-amber-500/10'}">
+            <div class="text-[9px] text-gray-500">GPU ${g.gpu}</div>
+            <div class="text-sm font-bold ${g.current_temp>=83?'text-red-400':g.current_temp>=75?'text-amber-400':'text-emerald-400'}">${g.current_temp}°C</div>
+            <div class="text-[9px] text-gray-500">${g.power_drop_pct > 0 ? '-'+g.power_drop_pct+'% pwr' : 'OK'}</div>
+          </div>`).join('')}
+        </div>
+      </div>`;
+    }
+  }
+  ttHTML += '</div>';
+
+  // ── 7. Call Volume Forecast ──
+  const cf = d.call_forecast || {};
+  let cfHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-sky-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Call Volume Forecast</h3>
+        <p class="text-[11px] text-gray-500">${cf.day || ''} — hourly call pattern (builds over time)</p>
+      </div>
+    </div>`;
+
+  const hours = cf.hours || [];
+  if (hours.length > 0 && hours.some(h => h.avg_calls > 0)) {
+    const maxAvg = Math.max(...hours.map(h => h.avg_calls), 1);
+    const peakHour = cf.peak_hour;
+    if (peakHour && peakHour.avg_calls > 0) {
+      cfHTML += `<div class="glass-bright rounded-lg p-3 mb-4 border-l-2 border-cyan-500">
+        <div class="text-[10px] text-gray-500 uppercase mb-1">Expected Peak Hour</div>
+        <div class="text-lg font-bold text-cyan-400">${peakHour.label} UTC</div>
+        <div class="text-[11px] text-gray-400">Avg ${peakHour.avg_calls} calls &middot; Peak ${peakHour.peak_calls}</div>
+      </div>`;
+    }
+    cfHTML += `<div class="glass-bright rounded-xl p-4 overflow-x-auto">
+      <div class="flex items-end gap-1" style="height:100px">
+        ${hours.map(h => {
+          const pct = maxAvg > 0 ? (h.avg_calls / maxAvg * 100) : 0;
+          const color = h.is_current ? '#06b6d4' : (h.avg_calls / maxAvg > 0.8 ? '#f59e0b' : '#22c55e');
+          return `<div class="flex flex-col items-center flex-1 gap-0.5">
+            <div class="w-full rounded-t" style="height:${Math.max(pct, 2)}%;background:${color};min-height:2px" title="${h.label}: avg ${h.avg_calls} calls"></div>
+            <span class="text-[8px] text-gray-500 ${h.is_current?'text-cyan-400 font-bold':''}">${h.hour % 3 === 0 ? h.label.replace(':00','') : ''}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  } else {
+    cfHTML += '<p class="text-gray-500 text-sm">Building call volume patterns... Data accumulates as calls are processed.</p>';
+  }
+  cfHTML += '</div>';
+
+  // ── 8. Disk & Log Growth ──
+  const dt = d.disk_trends || {};
+  let dtHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-gray-500 to-slate-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-white">Disk & Log Growth</h3>
+        <p class="text-[11px] text-gray-500">Storage usage trends and fill-time estimates</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+
+  for (const [sk, disk] of Object.entries(dt)) {
+    const diskColor = disk.status === 'critical' ? 'text-red-400' : disk.status === 'warning' ? 'text-amber-400' : 'text-emerald-400';
+    dtHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-sm font-semibold text-white">${disk.server_name}</span>
+        <span class="text-[10px] px-2 py-0.5 rounded-full ${disk.status==='critical'?'bg-red-500/20 text-red-400':disk.status==='warning'?'bg-amber-500/20 text-amber-400':'bg-emerald-500/20 text-emerald-400'}">${disk.status}</span>
+      </div>
+      <div class="flex items-baseline gap-2 mb-2">
+        <span class="text-2xl font-bold ${diskColor}">${disk.current_pct}%</span>
+        <span class="text-[10px] text-gray-500">used</span>
+      </div>
+      ${barHTML(disk.current_pct, 100, disk.current_pct >= 90 ? '#ef4444' : disk.current_pct >= 80 ? '#f59e0b' : '#22c55e')}
+      <div class="grid grid-cols-2 gap-2 mt-3">
+        <div class="text-[10px]"><span class="text-gray-500">Growth:</span> <span class="text-gray-300">${disk.growth_rate_pct_per_day}%/day</span></div>
+        <div class="text-[10px]"><span class="text-gray-500">Days until full:</span> <span class="${disk.days_until_full && disk.days_until_full < 7 ? 'text-red-400' : 'text-gray-300'}">${disk.days_until_full ? disk.days_until_full+'d' : '∞'}</span></div>
+      </div>
+      ${disk.trend && disk.trend.length > 1 ? `<div class="mt-2"><div class="text-[10px] text-gray-500 mb-1">Usage trend</div>${sparklineSVG(disk.trend, 200, 25, disk.current_pct >= 80 ? '#f59e0b' : '#22c55e')}</div>` : ''}
+    </div>`;
+  }
+  if (Object.keys(dt).length === 0) {
+    dtHTML += '<div class="glass-bright rounded-xl p-4 text-gray-500 text-sm col-span-2">Disk tracking starts after a few minutes of data collection.</div>';
+  }
+  dtHTML += '</div></div>';
+
+  el.innerHTML = paHTML + erHTML + phHTML + suHTML + clHTML + ttHTML + cfHTML + dtHTML;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -2580,6 +3360,7 @@ function renderAll() {
   else if (activeTab === 'daily') renderDaily();
   else if (activeTab === 'agent') renderAgent();
   else if (activeTab === 'analytics') renderAnalytics();
+  else if (activeTab === 'proactive') renderProactive();
 }
 
 // ── Data Fetching ──

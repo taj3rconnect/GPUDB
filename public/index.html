@@ -71,6 +71,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('daily')" id="tab-daily">24h Report</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
 </div>
 
 <!-- Content -->
@@ -82,6 +83,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-daily" class="hidden"></div>
   <div id="page-agent" class="hidden"></div>
   <div id="page-analytics" class="hidden"></div>
+  <div id="page-proactive" class="hidden"></div>
 </div>
 
 <script>
@@ -100,6 +102,7 @@ let dailyLoaded = false;
 let agentData = null;
 let analyticsData = null;
 let analyticsLoaded = false;
+let proactiveData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -136,7 +139,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -145,6 +148,7 @@ function switchTab(tab) {
   if (tab === 'daily' && !dailyLoaded) loadDaily();
   if (tab === 'agent') loadAgent();
   if (tab === 'analytics') loadAnalytics();
+  if (tab === 'proactive') loadProactive();
 }
 
 // ── Overview Tab ──
@@ -1238,6 +1242,217 @@ function renderAnalytics() {
   el.innerHTML = costHTML + cqHTML + bnHTML + hdHTML + qsHTML + alHTML + efHTML;
 }
 
+// ── Proactive Alerts & Ops Tab ──
+async function loadProactive() {
+  const el = document.getElementById('page-proactive');
+  if (!proactiveData) el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading proactive alerts...</div>';
+  try {
+    const r = await fetch('/api/gpu?endpoint=proactive');
+    proactiveData = await r.json();
+  } catch(e) {
+    proactiveData = { error: e.message };
+  }
+  renderProactive();
+}
+
+function renderProactive() {
+  const el = document.getElementById('page-proactive');
+  const d = proactiveData;
+  if (!d || d.error) {
+    el.innerHTML = `<div class="glass rounded-2xl p-6"><h3 class="text-lg font-semibold text-white">Proactive Alerts</h3><p class="text-red-400 text-sm mt-2">${d?.error||'Failed to load'}</p></div>`;
+    return;
+  }
+
+  const pa = d.predictive_alerts || [];
+  let paHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-red-500 to-orange-600 flex items-center justify-center">
+          <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        </div>
+        <div><h3 class="text-lg font-semibold text-white">Predictive Alerts</h3><p class="text-[11px] text-gray-500">Trend-based predictions — issues before they happen</p></div>
+      </div>
+      <button onclick="loadProactive()" class="text-xs px-3 py-1.5 rounded-lg bg-white/[0.05] text-gray-400 border border-gray-700 hover:bg-white/10 transition-colors">Refresh</button>
+    </div>`;
+  if (pa.length === 0) {
+    paHTML += '<div class="glass-bright rounded-lg p-4 text-center"><span class="text-emerald-400 text-sm font-medium">No predicted issues — all trends look healthy</span></div>';
+  } else {
+    paHTML += '<div class="space-y-2">';
+    for (const a of pa) {
+      const isCrit = a.severity === 'critical';
+      paHTML += `<div class="glass-bright rounded-lg p-3 ${isCrit?'border-l-2 border-red-500':'border-l-2 border-amber-500'}">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3"><span class="w-2 h-2 rounded-full ${isCrit?'bg-red-500 status-offline':'bg-amber-500'}"></span><div><span class="text-xs font-medium text-white">${a.metric}</span><span class="text-[10px] text-gray-500 ml-2">${a.server}</span></div></div>
+          <div class="flex items-center gap-3">
+            <span class="text-[10px] text-gray-400">Current: <span class="text-white font-medium">${a.current}</span></span>
+            ${a.eta_hours > 0 ? `<span class="text-[10px] px-2 py-0.5 rounded-full ${isCrit?'bg-red-500/20 text-red-400':'bg-amber-500/20 text-amber-400'}">ETA: ${a.eta_hours < 1 ? (a.eta_hours*60).toFixed(0)+'m' : a.eta_hours.toFixed(1)+'h'}</span>` : ''}
+          </div>
+        </div>
+        <div class="text-[11px] text-gray-400 mt-1.5 ml-5">${a.message}</div>
+      </div>`;
+    }
+    paHTML += '</div>';
+  }
+  paHTML += '</div>';
+
+  const er = d.error_rates || {};
+  let erHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-rose-500 to-pink-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Error Rate Tracker</h3><p class="text-[11px] text-gray-500">vLLM request failures and error trends</p></div>
+    </div><div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+  for (const [sk, e] of Object.entries(er)) {
+    const statusColor = e.status === 'critical' ? 'text-red-400' : e.status === 'warning' ? 'text-amber-400' : 'text-emerald-400';
+    const statusBg = e.status === 'critical' ? 'bg-red-500/20' : e.status === 'warning' ? 'bg-amber-500/20' : 'bg-emerald-500/20';
+    erHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-3"><span class="text-sm font-semibold text-white">${e.server_name}</span><span class="text-[10px] px-2 py-0.5 rounded-full ${statusBg} ${statusColor}">${e.status}</span></div>
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center"><div class="text-[9px] text-gray-500 uppercase">Window Errors</div><div class="text-base font-bold ${e.window_errors>0?'text-red-400':'text-emerald-400'}">${e.window_errors}</div></div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center"><div class="text-[9px] text-gray-500 uppercase">Window Rate</div><div class="text-base font-bold ${statusColor}">${e.window_rate}%</div></div>
+        <div class="bg-white/[0.02] rounded-lg p-2 text-center"><div class="text-[9px] text-gray-500 uppercase">Total Requests</div><div class="text-base font-bold text-white">${fmt(e.total_requests)}</div></div>
+      </div>
+      <div class="text-[10px] text-gray-500 mb-1">Error count trend</div>
+      ${sparklineSVG(e.sparkline || [], 200, 25, e.status === 'healthy' ? '#22c55e' : '#ef4444')}
+    </div>`;
+  }
+  if (!Object.keys(er).length) erHTML += '<div class="glass-bright rounded-xl p-4 text-gray-500 text-sm col-span-2">Collecting error data...</div>';
+  erHTML += '</div></div>';
+
+  const ph = d.process_health || {};
+  let phHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-violet-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Process Health Monitor</h3><p class="text-[11px] text-gray-500">Zombies, memory leaks, worker counts (RTX 5090)</p></div>
+    </div>`;
+  if (ph.samples) {
+    const zombieColor = ph.current_zombies >= 50 ? 'text-red-400' : ph.current_zombies >= 20 ? 'text-amber-400' : 'text-emerald-400';
+    phHTML += `<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Zombies</div><div class="text-2xl font-bold ${zombieColor}">${ph.current_zombies}</div><div class="text-[9px] text-gray-500">defunct</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Gunicorn RSS</div><div class="text-2xl font-bold ${ph.rss_leak_detected?'text-red-400':'text-white'}">${(ph.gunicorn_rss_mb/1024).toFixed(1)}G</div><div class="text-[9px] ${ph.rss_leak_detected?'text-red-400':'text-gray-500'}">${ph.rss_leak_detected?'LEAK DETECTED':'stable'}</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Workers</div><div class="text-2xl font-bold text-white">${ph.gunicorn_workers}</div><div class="text-[9px] text-gray-500">gunicorn</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Active Bots</div><div class="text-2xl font-bold ${ph.active_bots>0?'text-cyan-400':'text-gray-500'}">${ph.active_bots}</div><div class="text-[9px] text-gray-500">calls</div></div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Zombie Trend</div>${sparklineSVG(ph.zombie_trend||[],140,30,ph.current_zombies>=50?'#ef4444':'#f59e0b')}</div>
+      <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Memory Trend</div>${sparklineSVG(ph.rss_trend||[],140,30,ph.rss_leak_detected?'#ef4444':'#8b5cf6')}</div>
+      <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Workers</div>${sparklineSVG(ph.worker_trend||[],140,30,'#22c55e')}</div>
+      <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Bots</div>${sparklineSVG(ph.bot_trend||[],140,30,'#06b6d4')}</div>
+    </div>`;
+  } else phHTML += '<p class="text-gray-500 text-sm">Visit Agent tab first to start collecting process health data.</p>';
+  phHTML += '</div>';
+
+  const su = d.service_uptime || {};
+  let suHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Service Uptime</h3><p class="text-[11px] text-gray-500">Availability and incident history</p></div>
+    </div>`;
+  if (Object.keys(su).length > 0) {
+    suHTML += '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">';
+    for (const [name, s] of Object.entries(su)) {
+      const ok = s.status === 'active';
+      const uptimeColor = s.uptime_pct >= 99.9 ? 'text-emerald-400' : s.uptime_pct >= 99 ? 'text-amber-400' : 'text-red-400';
+      suHTML += `<div class="glass-bright rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2"><div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full ${ok?'bg-emerald-500':'bg-red-500'}"></span><span class="text-xs font-medium text-white">${name.replace('agentv2-','')}</span></div><span class="text-[10px] px-2 py-0.5 rounded-full ${ok?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400'}">${ok?'UP':'DOWN'}</span></div>
+        <div class="flex items-baseline gap-2 mb-2"><span class="text-xl font-bold ${uptimeColor}">${s.uptime_pct}%</span><span class="text-[10px] text-gray-500">uptime</span></div>
+        <div class="text-[10px] text-gray-500">Last change: ${s.last_change_ago}</div>
+        ${s.incidents?.length ? `<div class="mt-2 space-y-1">${s.incidents.slice(-3).map(i=>`<div class="text-[10px] text-gray-400 flex gap-2"><span class="${i.to==='active'?'text-emerald-400':'text-red-400'}">${i.from}→${i.to}</span><span class="text-gray-500">${i.time_ago}</span></div>`).join('')}</div>` : ''}
+      </div>`;
+    }
+    suHTML += '</div>';
+  } else suHTML += '<p class="text-gray-500 text-sm">Visit Agent tab first to start tracking uptime.</p>';
+  suHTML += '</div>';
+
+  const cl = d.cluster_latency || {};
+  let clHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Inter-Cluster Latency</h3><p class="text-[11px] text-gray-500">RTX 5090 → H200 round-trip (LLM/TTS path)</p></div>
+    </div>`;
+  if (cl.current_rtt_ms) {
+    const latColor = cl.status === 'critical' ? 'text-red-400' : cl.status === 'warning' ? 'text-amber-400' : 'text-emerald-400';
+    clHTML += `<div class="grid grid-cols-4 gap-3 mb-4">
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Current RTT</div><div class="text-xl font-bold ${latColor}">${cl.current_rtt_ms}ms</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Average</div><div class="text-xl font-bold text-white">${cl.avg_rtt_ms}ms</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Min</div><div class="text-xl font-bold text-emerald-400">${cl.min_rtt_ms}ms</div></div>
+      <div class="glass-bright rounded-lg p-3 text-center"><div class="text-[9px] text-gray-500 uppercase mb-1">Max</div><div class="text-xl font-bold ${cl.max_rtt_ms>1500?'text-red-400':'text-amber-400'}">${cl.max_rtt_ms}ms</div></div>
+    </div>
+    <div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Latency Over Time</div>${sparklineSVG(cl.trend||[],400,40,cl.status==='healthy'?'#22c55e':'#f59e0b')}</div>`;
+  } else clHTML += '<p class="text-gray-500 text-sm">Measuring inter-cluster latency on next refresh...</p>';
+  clHTML += '</div>';
+
+  const tt = d.thermal_throttling || {};
+  let ttHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">GPU Thermal Throttling</h3><p class="text-[11px] text-gray-500">Detects performance reduction due to heat</p></div>
+    </div>`;
+  if (!Object.keys(tt).length) {
+    ttHTML += '<div class="glass-bright rounded-lg p-4 text-center"><span class="text-emerald-400 text-sm font-medium">No thermal throttling detected</span></div>';
+  } else {
+    for (const [sk, t] of Object.entries(tt)) {
+      ttHTML += `<div class="glass-bright rounded-xl p-4 mb-3">
+        <div class="flex items-center justify-between mb-3"><span class="text-sm font-semibold text-white">${t.server_name}</span>${t.any_throttling?'<span class="text-[10px] px-2 py-0.5 rounded-full bg-red-500/20 text-red-400">THROTTLING</span>':'<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">HIGH TEMP</span>'}</div>
+        <div class="grid grid-cols-4 md:grid-cols-8 gap-2">${t.gpus.map(g=>`<div class="rounded-lg p-2 text-center ${g.likely_throttling?'bg-red-500/10 border border-red-500/20':'bg-amber-500/5 border border-amber-500/10'}"><div class="text-[9px] text-gray-500">GPU ${g.gpu}</div><div class="text-sm font-bold ${g.current_temp>=83?'text-red-400':g.current_temp>=75?'text-amber-400':'text-emerald-400'}">${g.current_temp}°C</div><div class="text-[9px] text-gray-500">${g.power_drop_pct>0?'-'+g.power_drop_pct+'% pwr':'OK'}</div></div>`).join('')}</div>
+      </div>`;
+    }
+  }
+  ttHTML += '</div>';
+
+  const cf = d.call_forecast || {};
+  const hours = cf.hours || [];
+  let cfHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-sky-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Call Volume Forecast</h3><p class="text-[11px] text-gray-500">${cf.day||''} — hourly call pattern</p></div>
+    </div>`;
+  if (hours.length > 0 && hours.some(h => h.avg_calls > 0)) {
+    const maxAvg = Math.max(...hours.map(h => h.avg_calls), 1);
+    const peakHour = cf.peak_hour;
+    if (peakHour?.avg_calls > 0) cfHTML += `<div class="glass-bright rounded-lg p-3 mb-4 border-l-2 border-cyan-500"><div class="text-[10px] text-gray-500 uppercase mb-1">Expected Peak Hour</div><div class="text-lg font-bold text-cyan-400">${peakHour.label} UTC</div><div class="text-[11px] text-gray-400">Avg ${peakHour.avg_calls} calls &middot; Peak ${peakHour.peak_calls}</div></div>`;
+    cfHTML += `<div class="glass-bright rounded-xl p-4 overflow-x-auto"><div class="flex items-end gap-1" style="height:100px">${hours.map(h=>{const pct=maxAvg>0?(h.avg_calls/maxAvg*100):0;const color=h.is_current?'#06b6d4':(h.avg_calls/maxAvg>0.8?'#f59e0b':'#22c55e');return `<div class="flex flex-col items-center flex-1 gap-0.5"><div class="w-full rounded-t" style="height:${Math.max(pct,2)}%;background:${color};min-height:2px" title="${h.label}: avg ${h.avg_calls}"></div><span class="text-[8px] text-gray-500 ${h.is_current?'text-cyan-400 font-bold':''}">${h.hour%3===0?h.label.replace(':00',''):''}</span></div>`;}).join('')}</div></div>`;
+  } else cfHTML += '<p class="text-gray-500 text-sm">Building call volume patterns...</p>';
+  cfHTML += '</div>';
+
+  const dsk = d.disk_trends || {};
+  let dtHTML = `<div class="glass rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-gray-500 to-slate-600 flex items-center justify-center">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+      </div>
+      <div><h3 class="text-lg font-semibold text-white">Disk & Log Growth</h3><p class="text-[11px] text-gray-500">Storage trends and fill-time estimates</p></div>
+    </div><div class="grid grid-cols-1 xl:grid-cols-2 gap-4">`;
+  for (const [sk, disk] of Object.entries(dsk)) {
+    const diskColor = disk.status==='critical'?'text-red-400':disk.status==='warning'?'text-amber-400':'text-emerald-400';
+    dtHTML += `<div class="glass-bright rounded-xl p-4">
+      <div class="flex items-center justify-between mb-3"><span class="text-sm font-semibold text-white">${disk.server_name}</span><span class="text-[10px] px-2 py-0.5 rounded-full ${disk.status==='critical'?'bg-red-500/20 text-red-400':disk.status==='warning'?'bg-amber-500/20 text-amber-400':'bg-emerald-500/20 text-emerald-400'}">${disk.status}</span></div>
+      <div class="flex items-baseline gap-2 mb-2"><span class="text-2xl font-bold ${diskColor}">${disk.current_pct}%</span><span class="text-[10px] text-gray-500">used</span></div>
+      ${barHTML(disk.current_pct,100,disk.current_pct>=90?'#ef4444':disk.current_pct>=80?'#f59e0b':'#22c55e')}
+      <div class="grid grid-cols-2 gap-2 mt-3">
+        <div class="text-[10px]"><span class="text-gray-500">Growth:</span> <span class="text-gray-300">${disk.growth_rate_pct_per_day}%/day</span></div>
+        <div class="text-[10px]"><span class="text-gray-500">Days until full:</span> <span class="${disk.days_until_full&&disk.days_until_full<7?'text-red-400':'text-gray-300'}">${disk.days_until_full?disk.days_until_full+'d':'∞'}</span></div>
+      </div>
+      ${disk.trend?.length>1?`<div class="mt-2"><div class="text-[10px] text-gray-500 mb-1">Usage trend</div>${sparklineSVG(disk.trend,200,25,disk.current_pct>=80?'#f59e0b':'#22c55e')}</div>`:''}
+    </div>`;
+  }
+  if (!Object.keys(dsk).length) dtHTML += '<div class="glass-bright rounded-xl p-4 text-gray-500 text-sm col-span-2">Disk tracking starts after a few minutes.</div>';
+  dtHTML += '</div></div>';
+
+  el.innerHTML = paHTML + erHTML + phHTML + suHTML + clHTML + ttHTML + cfHTML + dtHTML;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -1247,6 +1462,7 @@ function renderAll() {
   else if (activeTab === 'daily') renderDaily();
   else if (activeTab === 'agent') renderAgent();
   else if (activeTab === 'analytics') renderAnalytics();
+  else if (activeTab === 'proactive') renderProactive();
 }
 
 // ── Data Fetching ──

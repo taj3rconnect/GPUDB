@@ -47,6 +47,8 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/email-test"
         elif endpoint == "anomalies":
             upstream = f"{H200_API}/api/anomalies"
+        elif endpoint == "servers":
+            upstream = f"{H200_API}/api/servers"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
@@ -83,7 +85,7 @@ class handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         endpoint = params.get("endpoint", [""])[0]
 
-        post_endpoints = {"alerts-config": "/api/alerts-config", "sla": "/api/sla", "email-config": "/api/email-config", "email-test": "/api/email-test"}
+        post_endpoints = {"alerts-config": "/api/alerts-config", "sla": "/api/sla", "email-config": "/api/email-config", "email-test": "/api/email-test", "servers": "/api/servers"}
         if endpoint not in post_endpoints:
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

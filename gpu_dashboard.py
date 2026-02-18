@@ -1829,6 +1829,97 @@ async def send_test_email(request: Request):
     return result
 
 
+@app.get("/api/servers")
+async def get_servers():
+    """Get configured server list."""
+    result = {}
+    for key, s in SERVERS.items():
+        result[key] = {
+            "name": s["name"],
+            "host": s["host"],
+            "user": s.get("user", "ubuntu"),
+            "port": s.get("port", 22),
+            "gpu_model": s.get("gpu_model", "Unknown"),
+            "local": s.get("local", False),
+            "has_ecc": s.get("has_ecc", False),
+            "vllm_ports": s.get("vllm_ports", []),
+            "dcgm_port": s.get("dcgm_port", None),
+            "services": s.get("services", []),
+            "agent_ports": s.get("agent_ports", []),
+        }
+    return result
+
+
+@app.post("/api/servers")
+async def update_servers(request: Request):
+    """Add, edit, or remove a server."""
+    body = await request.json()
+    action = body.get("action", "")
+
+    if action == "add":
+        key = body.get("key", "").strip().lower().replace(" ", "_")
+        if not key or not body.get("host"):
+            return {"ok": False, "error": "key and host required"}
+        SERVERS[key] = {
+            "name": body.get("name", key),
+            "host": body["host"],
+            "user": body.get("user", "ubuntu"),
+            "port": int(body.get("port", 22)),
+            "gpu_model": body.get("gpu_model", "Unknown"),
+            "local": bool(body.get("local", False)),
+            "has_ecc": bool(body.get("has_ecc", False)),
+            "vllm_ports": body.get("vllm_ports", []),
+            "dcgm_port": body.get("dcgm_port", None),
+            "venvs": {},
+            "services": body.get("services", []),
+            "agent_ports": body.get("agent_ports", []),
+        }
+        # Initialize history stores for new server
+        from collections import deque
+        history[key] = deque(maxlen=MAX_HISTORY)
+        error_history[key] = deque(maxlen=MAX_HISTORY)
+        disk_history[key] = deque(maxlen=960)
+        gpu_clock_history[key] = {}
+        return {"ok": True, "servers": list(SERVERS.keys())}
+
+    elif action == "edit":
+        key = body.get("key", "")
+        if key not in SERVERS:
+            return {"ok": False, "error": f"Server '{key}' not found"}
+        s = SERVERS[key]
+        for field in ("name", "host", "user", "gpu_model"):
+            if field in body:
+                s[field] = body[field]
+        if "port" in body:
+            s["port"] = int(body["port"])
+        if "local" in body:
+            s["local"] = bool(body["local"])
+        if "has_ecc" in body:
+            s["has_ecc"] = bool(body["has_ecc"])
+        if "vllm_ports" in body:
+            s["vllm_ports"] = body["vllm_ports"]
+        if "dcgm_port" in body:
+            s["dcgm_port"] = body["dcgm_port"]
+        if "services" in body:
+            s["services"] = body["services"]
+        if "agent_ports" in body:
+            s["agent_ports"] = body["agent_ports"]
+        return {"ok": True, "server": key}
+
+    elif action == "remove":
+        key = body.get("key", "")
+        if key not in SERVERS:
+            return {"ok": False, "error": f"Server '{key}' not found"}
+        del SERVERS[key]
+        history.pop(key, None)
+        error_history.pop(key, None)
+        disk_history.pop(key, None)
+        gpu_clock_history.pop(key, None)
+        return {"ok": True, "servers": list(SERVERS.keys())}
+
+    return {"ok": False, "error": "action must be add, edit, or remove"}
+
+
 @app.get("/api/executive")
 async def get_executive():
     """Executive Summary — health score, daily report, H200 vs RTX 5090 comparison."""
@@ -3626,6 +3717,42 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
         <span id="nightModeLabel" style="display:none;color:#f59e0b;margin-left:6px" title="Auto hourly refresh 10PM-8AM EST">🌙 Night</span>
       </div>
       <div id="lastUpdate" class="text-xs text-gray-500"></div>
+      <button onclick="openServerSettings()" title="Server Settings" class="ml-2 p-1.5 rounded-lg hover:bg-gray-700 transition-colors text-gray-400 hover:text-white">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Server Settings Modal -->
+<div id="serverSettingsModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px)" onclick="if(event.target===this)closeServerSettings()">
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:700px;max-width:95vw;max-height:85vh;overflow-y:auto;background:#1e1e2e;border:1px solid #333;border-radius:12px;padding:24px">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-white">Server Configuration</h2>
+      <button onclick="closeServerSettings()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+    </div>
+    <div id="serverList" class="space-y-3 mb-4"></div>
+    <button onclick="showAddServerForm()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium transition-colors">+ Add Server</button>
+    <div id="addServerForm" style="display:none" class="mt-4 p-4 bg-surface-100 rounded-lg border border-gray-700">
+      <h3 class="text-sm font-semibold text-white mb-3">Add New Server</h3>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-gray-400">Key (unique ID)</label><input id="srv_key" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. a100_cluster"></div>
+        <div><label class="text-xs text-gray-400">Display Name</label><input id="srv_name" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. A100 Cluster"></div>
+        <div><label class="text-xs text-gray-400">Host / IP</label><input id="srv_host" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. 10.0.0.5"></div>
+        <div><label class="text-xs text-gray-400">SSH User</label><input id="srv_user" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" value="ubuntu"></div>
+        <div><label class="text-xs text-gray-400">SSH Port</label><input id="srv_port" type="number" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" value="22"></div>
+        <div><label class="text-xs text-gray-400">GPU Model</label><input id="srv_gpu" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. NVIDIA A100"></div>
+        <div><label class="text-xs text-gray-400">vLLM Ports (comma-sep)</label><input id="srv_vllm" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. 8001,8002"></div>
+        <div><label class="text-xs text-gray-400">Services (comma-sep)</label><input id="srv_services" class="w-full mt-1 px-2 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-white" placeholder="e.g. vllm-main,agent"></div>
+        <div class="flex items-center gap-4 col-span-2 mt-1">
+          <label class="flex items-center gap-2 text-xs text-gray-300"><input type="checkbox" id="srv_local"> Local (runs on this machine)</label>
+          <label class="flex items-center gap-2 text-xs text-gray-300"><input type="checkbox" id="srv_ecc"> Has ECC Memory</label>
+        </div>
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button onclick="addServer()" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm">Save</button>
+        <button onclick="document.getElementById('addServerForm').style.display='none'" class="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm">Cancel</button>
+      </div>
     </div>
   </div>
 </div>
@@ -6553,6 +6680,103 @@ function updateRefreshRate(val) {
   refreshRate = val || parseInt(document.getElementById('refreshRate').value);
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = setInterval(refresh, refreshRate);
+}
+
+// ── Server Settings ──
+async function openServerSettings() {
+  document.getElementById('serverSettingsModal').style.display = 'block';
+  document.getElementById('addServerForm').style.display = 'none';
+  try {
+    const r = await fetch('/api/servers');
+    const servers = await r.json();
+    const el = document.getElementById('serverList');
+    el.innerHTML = Object.entries(servers).map(([key, s]) => `
+      <div class="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full ${s.local ? 'bg-emerald-400' : 'bg-blue-400'}"></span>
+            <div>
+              <div class="text-sm font-medium text-white">${s.name} <span class="text-xs text-gray-500">(${key})</span></div>
+              <div class="text-xs text-gray-400">${s.host} &middot; ${s.user}@port ${s.port} &middot; ${s.gpu_model}</div>
+              <div class="text-xs text-gray-500 mt-0.5">${s.local ? 'Local' : 'SSH'} &middot; ECC: ${s.has_ecc ? 'Yes' : 'No'} &middot; vLLM: ${s.vllm_ports.length ? s.vllm_ports.join(',') : 'none'} &middot; Services: ${s.services.length || 0}</div>
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button onclick="editServer('${key}')" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded">Edit</button>
+            <button onclick="removeServer('${key}','${s.name}')" class="px-2 py-1 text-xs bg-red-900/50 hover:bg-red-800/50 text-red-400 rounded">Remove</button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) { document.getElementById('serverList').innerHTML = '<div class="text-red-400 text-sm">Failed to load servers</div>'; }
+}
+
+function closeServerSettings() { document.getElementById('serverSettingsModal').style.display = 'none'; }
+
+function showAddServerForm() {
+  const f = document.getElementById('addServerForm');
+  f.style.display = 'block';
+  f.querySelector('h3').textContent = 'Add New Server';
+  ['srv_key','srv_name','srv_host','srv_gpu','srv_vllm','srv_services'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('srv_user').value = 'ubuntu';
+  document.getElementById('srv_port').value = '22';
+  document.getElementById('srv_local').checked = false;
+  document.getElementById('srv_ecc').checked = false;
+  document.getElementById('srv_key').disabled = false;
+  window._editingServer = null;
+}
+
+async function editServer(key) {
+  const r = await fetch('/api/servers');
+  const servers = await r.json();
+  const s = servers[key];
+  if (!s) return;
+  const f = document.getElementById('addServerForm');
+  f.style.display = 'block';
+  f.querySelector('h3').textContent = 'Edit Server: ' + s.name;
+  document.getElementById('srv_key').value = key;
+  document.getElementById('srv_key').disabled = true;
+  document.getElementById('srv_name').value = s.name;
+  document.getElementById('srv_host').value = s.host;
+  document.getElementById('srv_user').value = s.user;
+  document.getElementById('srv_port').value = s.port;
+  document.getElementById('srv_gpu').value = s.gpu_model;
+  document.getElementById('srv_vllm').value = (s.vllm_ports||[]).join(',');
+  document.getElementById('srv_services').value = (s.services||[]).join(',');
+  document.getElementById('srv_local').checked = s.local;
+  document.getElementById('srv_ecc').checked = s.has_ecc;
+  window._editingServer = key;
+}
+
+async function addServer() {
+  const key = document.getElementById('srv_key').value.trim();
+  const host = document.getElementById('srv_host').value.trim();
+  if (!key || !host) { alert('Key and Host are required'); return; }
+  const vllmStr = document.getElementById('srv_vllm').value.trim();
+  const servicesStr = document.getElementById('srv_services').value.trim();
+  const body = {
+    action: window._editingServer ? 'edit' : 'add',
+    key: window._editingServer || key,
+    name: document.getElementById('srv_name').value.trim() || key,
+    host: host,
+    user: document.getElementById('srv_user').value.trim() || 'ubuntu',
+    port: parseInt(document.getElementById('srv_port').value) || 22,
+    gpu_model: document.getElementById('srv_gpu').value.trim() || 'Unknown',
+    vllm_ports: vllmStr ? vllmStr.split(',').map(p => parseInt(p.trim())).filter(p => p) : [],
+    services: servicesStr ? servicesStr.split(',').map(s => s.trim()).filter(s => s) : [],
+    local: document.getElementById('srv_local').checked,
+    has_ecc: document.getElementById('srv_ecc').checked,
+  };
+  const r = await fetch('/api/servers', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const res = await r.json();
+  if (res.ok) { openServerSettings(); } else { alert(res.error || 'Failed'); }
+}
+
+async function removeServer(key, name) {
+  if (!confirm('Remove server "' + name + '"? This will stop monitoring it.')) return;
+  const r = await fetch('/api/servers', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'remove',key:key})});
+  const res = await r.json();
+  if (res.ok) { openServerSettings(); } else { alert(res.error || 'Failed'); }
 }
 
 function checkNightMode() {

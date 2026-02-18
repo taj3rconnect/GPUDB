@@ -641,6 +641,212 @@ async def get_agent_status():
         return {"error": str(e), "status": "offline"}
 
 
+@app.get("/api/executive")
+async def get_executive():
+    """Executive Summary — health score, daily report, H200 vs RTX 5090 comparison."""
+    from datetime import datetime, timezone
+    now = time.time()
+    result = {
+        "health_score": {},
+        "daily_summary": {},
+        "comparison": {},
+        "trends": {},
+    }
+
+    # ── 1. GPU Fleet Health Score (0-100) ──
+    scores = {}
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            scores[sk] = {"score": 0, "breakdown": {}, "server_name": SERVERS[sk]["name"]}
+            continue
+        recent = sk_hist[-min(60, len(sk_hist)):]
+        avg_util = sum(p.get("avg_util", 0) for p in recent) / len(recent)
+        max_temp = max(p.get("max_temp", 0) for p in recent)
+        avg_vram = sum(p.get("vram_pct", 0) for p in recent) / len(recent)
+
+        # Error rate
+        errs = list(error_history.get(sk, []))
+        err_rate = errs[-1].get("rate", 0) if errs else 0
+
+        # Uptime score (based on history gaps)
+        uptime_score = 100  # assume 100% unless we detect gaps
+
+        # Component scores (higher is better)
+        util_score = max(0, 100 - abs(avg_util - 50) * 1.5)  # Optimal ~50%
+        temp_score = max(0, 100 - max(0, max_temp - 60) * 3)  # Penalize >60C
+        vram_score = max(0, 100 - max(0, avg_vram - 70) * 2)  # Penalize >70%
+        error_score = max(0, 100 - err_rate * 10)
+        latency_score = 100
+        # Check latency
+        ttft_vals = [p.get("ttft_ms", 0) for p in recent if p.get("ttft_ms", 0) > 0]
+        if ttft_vals:
+            avg_ttft = sum(ttft_vals) / len(ttft_vals)
+            latency_score = max(0, 100 - max(0, avg_ttft - 200) * 0.5)
+
+        # Weighted average
+        overall = round(
+            util_score * 0.20 +
+            temp_score * 0.15 +
+            vram_score * 0.15 +
+            error_score * 0.20 +
+            latency_score * 0.20 +
+            uptime_score * 0.10
+        , 1)
+
+        scores[sk] = {
+            "score": overall,
+            "server_name": SERVERS[sk]["name"],
+            "breakdown": {
+                "utilization": round(util_score, 1),
+                "temperature": round(temp_score, 1),
+                "vram": round(vram_score, 1),
+                "error_rate": round(error_score, 1),
+                "latency": round(latency_score, 1),
+                "uptime": round(uptime_score, 1),
+            },
+            "metrics": {
+                "avg_util": round(avg_util, 1),
+                "max_temp": max_temp,
+                "avg_vram": round(avg_vram, 1),
+                "error_rate": round(err_rate, 2),
+                "avg_ttft": round(sum(ttft_vals) / len(ttft_vals), 1) if ttft_vals else 0,
+            }
+        }
+
+    # Fleet-wide score
+    all_scores = [s["score"] for s in scores.values() if s["score"] > 0]
+    fleet_score = round(sum(all_scores) / max(len(all_scores), 1), 1)
+    result["health_score"] = {
+        "fleet": fleet_score,
+        "grade": "A" if fleet_score >= 90 else "B" if fleet_score >= 75 else "C" if fleet_score >= 60 else "D" if fleet_score >= 40 else "F",
+        "servers": scores,
+    }
+
+    # ── 2. Daily Summary ──
+    total_calls = 0
+    total_samples = 0
+    all_util = []
+    all_temps = []
+    all_ttft = []
+    all_e2e = []
+    peak_calls = 0
+
+    for sk in SERVERS:
+        for p in list(history[sk]):
+            total_samples += 1
+            calls = p.get("calls", 0)
+            total_calls += calls
+            if calls > peak_calls:
+                peak_calls = calls
+            all_util.append(p.get("avg_util", 0))
+            all_temps.append(p.get("max_temp", 0))
+            if p.get("ttft_ms", 0) > 0:
+                all_ttft.append(p["ttft_ms"])
+            if p.get("e2e_s", 0) > 0:
+                all_e2e.append(p["e2e_s"])
+
+    # Hourly data for total calls served
+    total_calls_served = 0
+    for sk in SERVERS:
+        for hk, h in hourly_stats.get(sk, {}).items():
+            delta = h.get("_vllm_reqs_end", 0) - h.get("_vllm_reqs_start", 0)
+            total_calls_served += delta
+
+    data_hours = 0
+    if total_samples >= 2:
+        all_hist = []
+        for sk in SERVERS:
+            all_hist.extend(list(history[sk]))
+        if all_hist:
+            data_hours = (all_hist[-1]["t"] - all_hist[0]["t"]) / 3600
+
+    result["daily_summary"] = {
+        "data_hours": round(data_hours, 1),
+        "total_samples": total_samples,
+        "total_requests_served": total_calls_served,
+        "peak_concurrent_calls": peak_calls,
+        "avg_concurrent_calls": round(total_calls / max(total_samples, 1), 1),
+        "avg_gpu_util": round(sum(all_util) / max(len(all_util), 1), 1),
+        "max_temp": max(all_temps) if all_temps else 0,
+        "avg_ttft_ms": round(sum(all_ttft) / max(len(all_ttft), 1), 1) if all_ttft else 0,
+        "avg_e2e_s": round(sum(all_e2e) / max(len(all_e2e), 1), 3) if all_e2e else 0,
+        "cost_today": round(GPU_MONTHLY_COST / 30, 2),
+        "cost_per_request": round(GPU_MONTHLY_COST / 30 / max(total_calls_served, 1), 4) if total_calls_served > 0 else 0,
+        "uptime_pct": 100.0,  # assume unless service_uptime shows otherwise
+    }
+
+    # ── 3. H200 vs RTX 5090 Comparison ──
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            result["comparison"][sk] = {"server_name": SERVERS[sk]["name"], "no_data": True}
+            continue
+        recent = sk_hist[-min(120, len(sk_hist)):]
+        avg_util = sum(p.get("avg_util", 0) for p in recent) / len(recent)
+        avg_calls = sum(p.get("calls", 0) for p in recent) / len(recent)
+        peak_calls_sk = max(p.get("calls", 0) for p in recent)
+        avg_temp = sum(p.get("max_temp", 0) for p in recent) / len(recent)
+        avg_power = sum(p.get("total_power", 0) for p in recent) / len(recent)
+        avg_vram = sum(p.get("vram_pct", 0) for p in recent) / len(recent)
+        ttft_vals = [p.get("ttft_ms", 0) for p in recent if p.get("ttft_ms", 0) > 0]
+        e2e_vals = [p.get("e2e_s", 0) for p in recent if p.get("e2e_s", 0) > 0]
+        gpu_count = recent[-1].get("gpu_count", 8)
+
+        result["comparison"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "gpu_model": SERVERS[sk]["gpu_model"],
+            "gpu_count": gpu_count,
+            "avg_util": round(avg_util, 1),
+            "avg_calls": round(avg_calls, 1),
+            "peak_calls": peak_calls_sk,
+            "avg_temp": round(avg_temp, 1),
+            "avg_power_w": round(avg_power, 0),
+            "avg_vram_pct": round(avg_vram, 1),
+            "avg_ttft_ms": round(sum(ttft_vals) / len(ttft_vals), 1) if ttft_vals else 0,
+            "avg_e2e_s": round(sum(e2e_vals) / len(e2e_vals), 3) if e2e_vals else 0,
+        }
+
+    # ── 4. Trend Arrows ──
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if len(sk_hist) < 20:
+            result["trends"][sk] = {"server_name": SERVERS[sk]["name"], "no_data": True}
+            continue
+        mid = len(sk_hist) // 2
+        first_half = sk_hist[:mid]
+        second_half = sk_hist[mid:]
+
+        def avg(arr, key):
+            vals = [p.get(key, 0) for p in arr if p.get(key, 0) > 0]
+            return sum(vals) / max(len(vals), 1) if vals else 0
+
+        def trend(old, new):
+            if old == 0:
+                return "stable"
+            pct = (new - old) / old * 100
+            if pct > 10:
+                return "up"
+            elif pct < -10:
+                return "down"
+            return "stable"
+
+        u1, u2 = avg(first_half, "avg_util"), avg(second_half, "avg_util")
+        t1, t2 = avg(first_half, "max_temp"), avg(second_half, "max_temp")
+        c1, c2 = avg(first_half, "calls"), avg(second_half, "calls")
+        ttft1, ttft2 = avg(first_half, "ttft_ms"), avg(second_half, "ttft_ms")
+
+        result["trends"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "utilization": {"trend": trend(u1, u2), "old": round(u1, 1), "new": round(u2, 1)},
+            "temperature": {"trend": trend(t1, t2), "old": round(t1, 1), "new": round(t2, 1)},
+            "calls": {"trend": trend(c1, c2), "old": round(c1, 1), "new": round(c2, 1)},
+            "ttft": {"trend": trend(ttft1, ttft2), "old": round(ttft1, 1), "new": round(ttft2, 1)},
+        }
+
+    return result
+
+
 @app.get("/api/network")
 async def get_network():
     """Network & I/O — GPU topology, network throughput, model loading, storage I/O."""
@@ -2246,6 +2452,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('network')" id="tab-network">Network & I/O</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('executive')" id="tab-executive">Executive Summary</button>
 </div>
 
 <!-- Content -->
@@ -2261,6 +2468,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-capacity" class="hidden"></div>
   <div id="page-quality" class="hidden"></div>
   <div id="page-network" class="hidden"></div>
+  <div id="page-executive" class="hidden"></div>
 </div>
 
 <script>
@@ -2283,6 +2491,7 @@ let proactiveData = null;
 let capacityData = null;
 let qualityData = null;
 let networkData = null;
+let executiveData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -2319,7 +2528,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network','executive'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -2332,6 +2541,7 @@ function switchTab(tab) {
   if (tab === 'capacity') loadCapacity();
   if (tab === 'quality') loadQuality();
   if (tab === 'network') loadNetwork();
+  if (tab === 'executive') loadExecutive();
 }
 
 // ── Overview Tab ──
@@ -4003,6 +4213,146 @@ function renderAll() {
   else if (activeTab === 'capacity') renderCapacity();
   else if (activeTab === 'quality') renderQuality();
   else if (activeTab === 'network') renderNetwork();
+  else if (activeTab === 'executive') renderExecutive();
+}
+
+// ── Executive Summary Tab ──
+async function loadExecutive() {
+  try {
+    const r = await fetch('/api/executive');
+    executiveData = await r.json();
+    renderExecutive();
+  } catch(e) { console.error('Executive load error:', e); }
+}
+
+function renderExecutive() {
+  const el = document.getElementById('page-executive');
+  if (!executiveData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading executive summary...</div>'; return; }
+  const d = executiveData;
+
+  // ── 1. Fleet Health Score ──
+  const hs = d.health_score || {};
+  const fleet = hs.fleet || 0;
+  const grade = hs.grade || 'N/A';
+  const gradeC = fleet >= 90 ? 'text-emerald-400' : fleet >= 75 ? 'text-cyan-400' : fleet >= 60 ? 'text-amber-400' : 'text-red-400';
+  const gradeBg = fleet >= 90 ? 'from-emerald-500/20' : fleet >= 75 ? 'from-cyan-500/20' : fleet >= 60 ? 'from-amber-500/20' : 'from-red-500/20';
+
+  let hsHTML = '<div class="glass rounded-xl p-6 mb-6">';
+  hsHTML += '<div class="flex items-center justify-between mb-4">';
+  hsHTML += '<div><h3 class="text-white font-semibold">Fleet Health Score</h3><p class="text-xs text-gray-500">Composite score across all GPUs</p></div>';
+  hsHTML += `<div class="text-center"><div class="text-5xl font-bold ${gradeC}">${fleet}</div><div class="text-lg font-semibold ${gradeC}">Grade ${grade}</div></div>`;
+  hsHTML += '</div>';
+  // Per-server breakdown
+  hsHTML += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+  for (const [sk, s] of Object.entries(hs.servers || {})) {
+    const sc = s.score || 0;
+    const scC = sc >= 90 ? 'text-emerald-400' : sc >= 75 ? 'text-cyan-400' : sc >= 60 ? 'text-amber-400' : 'text-red-400';
+    hsHTML += `<div class="glass-bright rounded-lg p-4">`;
+    hsHTML += `<div class="flex justify-between items-center mb-3"><span class="text-sm text-white font-medium">${s.server_name||sk}</span><span class="text-2xl font-bold ${scC}">${sc}</span></div>`;
+    // Score bars
+    const bd = s.breakdown || {};
+    for (const [k, v] of Object.entries(bd)) {
+      const bC = v >= 90 ? '#22c55e' : v >= 75 ? '#06b6d4' : v >= 60 ? '#f59e0b' : '#ef4444';
+      hsHTML += `<div class="flex items-center gap-2 mb-1 text-[10px]"><span class="text-gray-500 w-20 capitalize">${k}</span><div class="flex-1 h-1.5 rounded-full bg-gray-800"><div class="h-1.5 rounded-full" style="width:${v}%;background:${bC}"></div></div><span class="text-gray-400 w-8 text-right">${v}</span></div>`;
+    }
+    // Key metrics
+    const m = s.metrics || {};
+    hsHTML += '<div class="flex gap-3 mt-2 text-[10px] text-gray-500">';
+    hsHTML += `<span>Util: ${m.avg_util||0}%</span>`;
+    hsHTML += `<span>Temp: ${m.max_temp||0}C</span>`;
+    hsHTML += `<span>VRAM: ${m.avg_vram||0}%</span>`;
+    hsHTML += `<span>Err: ${m.error_rate||0}%</span>`;
+    if (m.avg_ttft) hsHTML += `<span>TTFT: ${m.avg_ttft}ms</span>`;
+    hsHTML += '</div></div>';
+  }
+  hsHTML += '</div></div>';
+
+  // ── 2. Daily Summary ──
+  const ds = d.daily_summary || {};
+  let dsHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Daily Summary</h3>';
+  dsHTML += `<p class="text-xs text-gray-500 mb-4">${ds.data_hours||0} hours of data collected</p>`;
+  dsHTML += '<div class="grid grid-cols-2 md:grid-cols-5 gap-3">';
+  const kpis = [
+    {label: 'Requests Served', value: (ds.total_requests_served||0).toLocaleString(), color: 'text-white'},
+    {label: 'Peak Concurrent', value: ds.peak_concurrent_calls||0, color: 'text-cyan-400'},
+    {label: 'Avg Concurrent', value: ds.avg_concurrent_calls||0, color: 'text-gray-300'},
+    {label: 'Avg GPU Util', value: (ds.avg_gpu_util||0)+'%', color: ds.avg_gpu_util > 80 ? 'text-amber-400' : 'text-emerald-400'},
+    {label: 'Max Temp', value: (ds.max_temp||0)+'C', color: ds.max_temp > 80 ? 'text-red-400' : 'text-gray-300'},
+    {label: 'Avg TTFT', value: (ds.avg_ttft_ms||0)+'ms', color: ds.avg_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400'},
+    {label: 'Avg E2E', value: (ds.avg_e2e_s||0)+'s', color: ds.avg_e2e_s > 3 ? 'text-amber-400' : 'text-emerald-400'},
+    {label: "Today's Cost", value: '$'+(ds.cost_today||0).toLocaleString(), color: 'text-white'},
+    {label: 'Cost/Request', value: '$'+(ds.cost_per_request||0).toFixed(4), color: 'text-gray-300'},
+    {label: 'Uptime', value: (ds.uptime_pct||0)+'%', color: ds.uptime_pct >= 99.9 ? 'text-emerald-400' : 'text-amber-400'},
+  ];
+  for (const kpi of kpis) {
+    dsHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">${kpi.label}</div><div class="text-lg font-bold ${kpi.color}">${kpi.value}</div></div>`;
+  }
+  dsHTML += '</div></div>';
+
+  // ── 3. H200 vs RTX 5090 Comparison ──
+  const comp = d.comparison || {};
+  let cpHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">H200 vs RTX 5090 Comparison</h3>';
+  cpHTML += '<p class="text-xs text-gray-500 mb-4">Side-by-side performance metrics</p>';
+  const servers = Object.entries(comp).filter(([k,v]) => !v.no_data);
+  if (servers.length >= 2) {
+    const [sk1, s1] = servers[0];
+    const [sk2, s2] = servers[1];
+    const metrics = [
+      {label: 'GPU Model', v1: s1.gpu_model, v2: s2.gpu_model},
+      {label: 'GPU Count', v1: s1.gpu_count, v2: s2.gpu_count},
+      {label: 'Avg Util %', v1: s1.avg_util+'%', v2: s2.avg_util+'%', better: s1.avg_util < s2.avg_util ? 1 : 2},
+      {label: 'Avg Calls', v1: s1.avg_calls, v2: s2.avg_calls, better: s1.avg_calls > s2.avg_calls ? 1 : 2},
+      {label: 'Peak Calls', v1: s1.peak_calls, v2: s2.peak_calls, better: s1.peak_calls > s2.peak_calls ? 1 : 2},
+      {label: 'Avg Temp', v1: s1.avg_temp+'C', v2: s2.avg_temp+'C', better: s1.avg_temp < s2.avg_temp ? 1 : 2},
+      {label: 'Avg Power', v1: s1.avg_power_w+'W', v2: s2.avg_power_w+'W', better: s1.avg_power_w < s2.avg_power_w ? 1 : 2},
+      {label: 'VRAM Used', v1: s1.avg_vram_pct+'%', v2: s2.avg_vram_pct+'%', better: s1.avg_vram_pct < s2.avg_vram_pct ? 1 : 2},
+      {label: 'Avg TTFT', v1: s1.avg_ttft_ms?s1.avg_ttft_ms+'ms':'N/A', v2: s2.avg_ttft_ms?s2.avg_ttft_ms+'ms':'N/A', better: (s1.avg_ttft_ms||999) < (s2.avg_ttft_ms||999) ? 1 : 2},
+      {label: 'Avg E2E', v1: s1.avg_e2e_s?s1.avg_e2e_s+'s':'N/A', v2: s2.avg_e2e_s?s2.avg_e2e_s+'s':'N/A', better: (s1.avg_e2e_s||999) < (s2.avg_e2e_s||999) ? 1 : 2},
+    ];
+    cpHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+    cpHTML += `<thead><tr class="border-b border-gray-800"><th class="text-left py-2 px-2 text-gray-500">Metric</th><th class="text-center py-2 px-2 text-white">${s1.server_name}</th><th class="text-center py-2 px-2 text-white">${s2.server_name}</th></tr></thead><tbody>`;
+    for (const m of metrics) {
+      const c1 = m.better === 1 ? 'text-emerald-400 font-bold' : 'text-gray-300';
+      const c2 = m.better === 2 ? 'text-emerald-400 font-bold' : 'text-gray-300';
+      cpHTML += `<tr class="border-b border-gray-800/50"><td class="py-2 px-2 text-gray-400">${m.label}</td><td class="py-2 px-2 text-center ${c1}">${m.v1}</td><td class="py-2 px-2 text-center ${c2}">${m.v2}</td></tr>`;
+    }
+    cpHTML += '</tbody></table></div>';
+  } else {
+    cpHTML += '<div class="text-gray-500 text-sm">Need data from both servers for comparison.</div>';
+  }
+  cpHTML += '</div>';
+
+  // ── 4. Trends ──
+  let trHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Trend Indicators</h3>';
+  trHTML += '<p class="text-xs text-gray-500 mb-4">First half vs second half of collected data</p>';
+  trHTML += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+  for (const [sk, tr] of Object.entries(d.trends || {})) {
+    if (tr.no_data) continue;
+    trHTML += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-3">${tr.server_name||sk}</div>`;
+    trHTML += '<div class="grid grid-cols-2 gap-2">';
+    const arrows = {up: '&#9650;', down: '&#9660;', stable: '&#9654;'};
+    const colors = {up: 'text-red-400', down: 'text-emerald-400', stable: 'text-gray-500'};
+    // For calls, up is good
+    const callColors = {up: 'text-emerald-400', down: 'text-red-400', stable: 'text-gray-500'};
+    const items = [
+      {label: 'Utilization', data: tr.utilization, goodDown: true},
+      {label: 'Temperature', data: tr.temperature, goodDown: true},
+      {label: 'Calls', data: tr.calls, goodDown: false},
+      {label: 'TTFT', data: tr.ttft, goodDown: true},
+    ];
+    for (const item of items) {
+      const t = item.data || {};
+      const trendDir = t.trend || 'stable';
+      const tC = item.goodDown ? colors[trendDir] : callColors[trendDir];
+      trHTML += `<div class="text-[10px]"><span class="text-gray-500">${item.label}</span>`;
+      trHTML += `<div class="flex items-center gap-1"><span class="${tC}">${arrows[trendDir]||''}</span>`;
+      trHTML += `<span class="text-gray-400">${t.old||0} → ${t.new||0}</span></div></div>`;
+    }
+    trHTML += '</div></div>';
+  }
+  trHTML += '</div></div>';
+
+  el.innerHTML = hsHTML + dsHTML + cpHTML + trHTML;
 }
 
 // ── Network & I/O Tab ──

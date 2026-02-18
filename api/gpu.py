@@ -27,6 +27,8 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/quality"
         elif endpoint == "network":
             upstream = f"{H200_API}/api/network"
+        elif endpoint == "executive":
+            upstream = f"{H200_API}/api/executive"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

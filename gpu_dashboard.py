@@ -641,6 +641,183 @@ async def get_agent_status():
         return {"error": str(e), "status": "offline"}
 
 
+@app.get("/api/capacity")
+async def get_capacity():
+    """Capacity Planner — What-If simulator, ROI, scale recommendations, cloud comparison."""
+    result = {
+        "what_if": [],
+        "roi": {},
+        "scale_recommendation": {},
+        "cloud_comparison": [],
+        "per_server": {},
+    }
+
+    # Gather recent data across all servers
+    all_recent = {}
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            continue
+        recent = sk_hist[-min(120, len(sk_hist)):]
+        avg_util = sum(p.get("avg_util", 0) for p in recent) / len(recent)
+        avg_calls = sum(p.get("calls", 0) for p in recent) / len(recent)
+        peak_calls = max(p.get("calls", 0) for p in recent)
+        avg_kv = sum(p.get("kv_cache", 0) for p in recent) / len(recent)
+        avg_vram = sum(p.get("vram_pct", 0) for p in recent) / len(recent)
+        avg_ttft = sum(p.get("ttft_ms", 0) for p in recent if p.get("ttft_ms", 0) > 0)
+        ttft_count = sum(1 for p in recent if p.get("ttft_ms", 0) > 0)
+        avg_ttft = avg_ttft / ttft_count if ttft_count > 0 else 0
+        avg_e2e = sum(p.get("e2e_s", 0) for p in recent if p.get("e2e_s", 0) > 0)
+        e2e_count = sum(1 for p in recent if p.get("e2e_s", 0) > 0)
+        avg_e2e = avg_e2e / e2e_count if e2e_count > 0 else 0
+        gpu_count = recent[-1].get("gpu_count", 8)
+        avg_power = sum(p.get("total_power", 0) for p in recent) / len(recent)
+
+        all_recent[sk] = {
+            "avg_util": avg_util, "avg_calls": avg_calls, "peak_calls": peak_calls,
+            "avg_kv": avg_kv, "avg_vram": avg_vram, "avg_ttft": avg_ttft,
+            "avg_e2e": avg_e2e, "gpu_count": gpu_count, "avg_power": avg_power,
+        }
+
+    total_avg_util = sum(d["avg_util"] for d in all_recent.values()) / max(len(all_recent), 1)
+    total_avg_calls = sum(d["avg_calls"] for d in all_recent.values())
+    total_peak_calls = sum(d["peak_calls"] for d in all_recent.values())
+    total_gpu_count = sum(d["gpu_count"] for d in all_recent.values())
+
+    # Util per call across fleet
+    util_per_call = total_avg_util / max(total_avg_calls, 0.1)
+
+    # ── 1. What-If Simulator ──
+    for target_calls in [1, 2, 5, 10, 20, 50, 75, 100, 150, 200]:
+        projected_util = util_per_call * target_calls
+        # Latency degrades exponentially as utilization approaches 100%
+        load_factor = min(projected_util / 100, 0.99)
+        # M/M/c queuing approximation: latency ~ 1/(1-rho) * base_latency
+        latency_multiplier = 1 / max(1 - load_factor, 0.01) if load_factor < 1 else 100
+        base_ttft = sum(d["avg_ttft"] for d in all_recent.values()) / max(len(all_recent), 1)
+        base_e2e = sum(d["avg_e2e"] for d in all_recent.values()) / max(len(all_recent), 1)
+        proj_ttft = base_ttft * min(latency_multiplier, 50)
+        proj_e2e = base_e2e * min(latency_multiplier, 50)
+
+        # KV cache scales linearly with calls
+        kv_per_call = sum(d["avg_kv"] for d in all_recent.values()) / max(total_avg_calls, 0.1)
+        proj_kv = kv_per_call * target_calls
+
+        # GPUs needed to keep util < 80%
+        gpus_needed = max(1, int((util_per_call * target_calls / 80) * total_gpu_count + 0.5)) if util_per_call > 0 else total_gpu_count
+
+        feasible = projected_util < 95 and proj_kv < 95
+        quality = "good" if projected_util < 60 else "degraded" if projected_util < 85 else "poor"
+
+        result["what_if"].append({
+            "target_calls": target_calls,
+            "projected_gpu_util": round(min(projected_util, 100), 1),
+            "projected_ttft_ms": round(proj_ttft, 1),
+            "projected_e2e_s": round(proj_e2e, 3),
+            "projected_kv_cache": round(min(proj_kv, 100), 1),
+            "gpus_needed_for_80pct": gpus_needed,
+            "feasible": feasible,
+            "quality": quality,
+        })
+
+    # ── 2. GPU ROI Calculator ──
+    # Assume revenue per call-minute (configurable, default estimate)
+    # Using cost data to compute break-even
+    calls_per_hour = total_avg_calls * 60  # assuming avg call ~ 1 min
+    cost_per_call = COST_PER_HOUR / max(calls_per_hour, 0.01)
+    # Break-even: at what concurrent call level does cost per call drop below target
+    breakeven_calls = []
+    for target_cost in [0.01, 0.02, 0.05, 0.10, 0.25, 0.50]:
+        needed = COST_PER_HOUR / 60 / target_cost if target_cost > 0 else 999
+        breakeven_calls.append({"target_cost_per_min": target_cost, "min_concurrent_calls": round(needed, 1)})
+
+    result["roi"] = {
+        "monthly_cost": GPU_MONTHLY_COST,
+        "hourly_cost": COST_PER_HOUR,
+        "current_avg_calls": round(total_avg_calls, 1),
+        "current_cost_per_call_min": round(COST_PER_HOUR / 60 / max(total_avg_calls, 0.01), 4),
+        "current_cost_per_call_hour": round(COST_PER_HOUR / max(total_avg_calls, 0.01), 2),
+        "idle_waste_hourly": round(COST_PER_HOUR * max(0, 1 - total_avg_util / 100), 2),
+        "idle_waste_monthly": round(GPU_MONTHLY_COST * max(0, 1 - total_avg_util / 100), 0),
+        "effective_util_pct": round(total_avg_util, 1),
+        "breakeven": breakeven_calls,
+        "revenue_needed_monthly": GPU_MONTHLY_COST,
+        "calls_to_break_even_at_1c": round(GPU_MONTHLY_COST / 0.01 / 30 / 24, 0),  # calls/hour at $0.01/call
+    }
+
+    # ── 3. Scale-Up/Down Recommendations ──
+    # Based on peak utilization and current GPU count
+    peak_util = max((d.get("avg_util", 0) for d in all_recent.values()), default=0)
+    # Find p95 utilization from history
+    all_utils = []
+    for sk in SERVERS:
+        for p in list(history[sk])[-300:]:
+            all_utils.append(p.get("avg_util", 0))
+    all_utils.sort()
+    p95_util = all_utils[int(len(all_utils) * 0.95)] if all_utils else 0
+    p99_util = all_utils[int(len(all_utils) * 0.99)] if all_utils else 0
+
+    # Min GPUs to handle p95 load at 80% target
+    min_gpus_p95 = max(1, int(total_gpu_count * (p95_util / 80) + 0.5)) if p95_util > 0 else total_gpu_count
+    min_gpus_p99 = max(1, int(total_gpu_count * (p99_util / 80) + 0.5)) if p99_util > 0 else total_gpu_count
+    savings_if_downscale = round((total_gpu_count - min_gpus_p95) * COST_PER_GPU_HOUR * 24 * 30, 0) if min_gpus_p95 < total_gpu_count else 0
+
+    action = "optimal"
+    detail = "Current GPU count matches workload."
+    if p95_util > 85:
+        action = "scale_up"
+        extra = max(1, int(total_gpu_count * (p95_util / 70) - total_gpu_count + 0.5))
+        detail = f"P95 utilization is {p95_util:.0f}%. Add {extra} GPUs to bring p95 below 70%."
+    elif p95_util < 30 and total_gpu_count > 4:
+        action = "scale_down"
+        detail = f"P95 utilization is only {p95_util:.0f}%. You could reduce to {min_gpus_p95} GPUs and save ${savings_if_downscale:,.0f}/month."
+
+    result["scale_recommendation"] = {
+        "action": action,
+        "detail": detail,
+        "current_gpus": total_gpu_count,
+        "p95_util": round(p95_util, 1),
+        "p99_util": round(p99_util, 1),
+        "min_gpus_for_p95": min_gpus_p95,
+        "min_gpus_for_p99": min_gpus_p99,
+        "monthly_savings_if_downscale": savings_if_downscale,
+        "peak_calls": total_peak_calls,
+        "avg_calls": round(total_avg_calls, 1),
+    }
+
+    # ── 4. Cloud Cost Comparison ──
+    # Compare against major cloud GPU pricing (approximate 2024-2025 rates)
+    cloud_providers = [
+        {"provider": "AWS p5.48xlarge", "gpu": "8x H100 80GB", "hourly": 98.32, "monthly": round(98.32 * 730, 0), "note": "On-demand, closest to H200"},
+        {"provider": "AWS p5e.48xlarge", "gpu": "8x H200 141GB", "hourly": 115.00, "monthly": round(115.00 * 730, 0), "note": "On-demand H200"},
+        {"provider": "GCP a3-highgpu-8g", "gpu": "8x H100 80GB", "hourly": 98.32, "monthly": round(98.32 * 730, 0), "note": "On-demand"},
+        {"provider": "Lambda Labs H100", "gpu": "8x H100 80GB", "hourly": 27.92, "monthly": round(27.92 * 730, 0), "note": "Reserved"},
+        {"provider": "CoreWeave H100", "gpu": "8x H100 80GB", "hourly": 25.20, "monthly": round(25.20 * 730, 0), "note": "1-year commitment"},
+    ]
+    your_equiv_hourly = COST_PER_HOUR
+    for cp in cloud_providers:
+        # Scale to match your GPU count (16 GPUs = 2x 8-GPU instances)
+        scaled_monthly = cp["monthly"] * (total_gpu_count / 8)
+        cp["scaled_monthly"] = round(scaled_monthly, 0)
+        cp["savings_vs_you"] = round(scaled_monthly - GPU_MONTHLY_COST, 0)
+        cp["savings_pct"] = round((1 - GPU_MONTHLY_COST / max(scaled_monthly, 1)) * 100, 1) if scaled_monthly > GPU_MONTHLY_COST else round((GPU_MONTHLY_COST / max(scaled_monthly, 1) - 1) * -100, 1)
+    result["cloud_comparison"] = cloud_providers
+
+    # Per-server breakdown
+    for sk, d in all_recent.items():
+        result["per_server"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "gpu_count": d["gpu_count"],
+            "avg_util": round(d["avg_util"], 1),
+            "avg_calls": round(d["avg_calls"], 1),
+            "peak_calls": d["peak_calls"],
+            "avg_kv": round(d["avg_kv"], 1),
+            "avg_vram": round(d["avg_vram"], 1),
+        }
+
+    return result
+
+
 @app.get("/api/proactive")
 async def get_proactive_alerts():
     now = time.time()
@@ -1720,6 +1897,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
 </div>
 
 <!-- Content -->
@@ -1732,6 +1910,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-agent" class="hidden"></div>
   <div id="page-analytics" class="hidden"></div>
   <div id="page-proactive" class="hidden"></div>
+  <div id="page-capacity" class="hidden"></div>
 </div>
 
 <script>
@@ -1751,6 +1930,7 @@ let agentData = null;
 let analyticsData = null;
 let analyticsLoaded = false;
 let proactiveData = null;
+let capacityData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -1787,7 +1967,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -1797,6 +1977,7 @@ function switchTab(tab) {
   if (tab === 'agent') loadAgent();
   if (tab === 'analytics') loadAnalytics();
   if (tab === 'proactive') loadProactive();
+  if (tab === 'capacity') loadCapacity();
 }
 
 // ── Overview Tab ──
@@ -3351,6 +3532,110 @@ function renderProactive() {
   el.innerHTML = paHTML + erHTML + phHTML + suHTML + clHTML + ttHTML + cfHTML + dtHTML;
 }
 
+// ── Capacity Planner Tab ──
+async function loadCapacity() {
+  try {
+    const r = await fetch('/api/capacity');
+    capacityData = await r.json();
+    renderCapacity();
+  } catch(e) { console.error('Capacity load error:', e); }
+}
+
+function renderCapacity() {
+  const el = document.getElementById('page-capacity');
+  if (!capacityData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading capacity data...</div>'; return; }
+  const d = capacityData;
+
+  // ── 1. What-If Simulator ──
+  let wiHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">What-If Simulator</h3>';
+  wiHTML += '<p class="text-xs text-gray-500 mb-4">Projected metrics at different concurrent call levels</p>';
+  wiHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  wiHTML += '<thead><tr class="text-gray-500 border-b border-gray-800">';
+  wiHTML += '<th class="text-left py-2 px-2">Calls</th><th class="text-right py-2 px-2">GPU Util</th><th class="text-right py-2 px-2">TTFT (ms)</th><th class="text-right py-2 px-2">E2E (s)</th><th class="text-right py-2 px-2">KV Cache</th><th class="text-right py-2 px-2">GPUs Needed</th><th class="text-center py-2 px-2">Quality</th><th class="text-center py-2 px-2">Feasible</th>';
+  wiHTML += '</tr></thead><tbody>';
+  for (const w of (d.what_if || [])) {
+    const utilC = w.projected_gpu_util > 85 ? 'text-red-400' : w.projected_gpu_util > 60 ? 'text-amber-400' : 'text-emerald-400';
+    const qC = w.quality === 'good' ? 'text-emerald-400' : w.quality === 'degraded' ? 'text-amber-400' : 'text-red-400';
+    const fC = w.feasible ? 'text-emerald-400' : 'text-red-400';
+    const ttftC = w.projected_ttft_ms > 600 ? 'text-red-400' : w.projected_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400';
+    const highlight = w.target_calls === Math.round(d.roi?.current_avg_calls || 0) ? 'bg-emerald-500/10' : '';
+    wiHTML += `<tr class="border-b border-gray-800/50 ${highlight}">`;
+    wiHTML += `<td class="py-2 px-2 text-white font-medium">${w.target_calls}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right ${utilC}">${w.projected_gpu_util}%</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right ${ttftC}">${w.projected_ttft_ms.toFixed(0)}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.projected_e2e_s.toFixed(2)}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.projected_kv_cache}%</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.gpus_needed_for_80pct}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-center ${qC}">${w.quality}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-center ${fC}">${w.feasible ? 'Yes' : 'No'}</td>`;
+    wiHTML += '</tr>';
+  }
+  wiHTML += '</tbody></table></div></div>';
+
+  // ── 2. GPU ROI Calculator ──
+  const roi = d.roi || {};
+  let roiHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">GPU ROI Calculator</h3>';
+  roiHTML += '<p class="text-xs text-gray-500 mb-4">Cost efficiency and break-even analysis</p>';
+  roiHTML += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Monthly Cost</div><div class="text-lg font-bold text-white">$${(roi.monthly_cost||0).toLocaleString()}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Cost / Call-Min</div><div class="text-lg font-bold ${(roi.current_cost_per_call_min||0) > 0.10 ? 'text-red-400' : 'text-emerald-400'}">$${(roi.current_cost_per_call_min||0).toFixed(4)}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Idle Waste / Month</div><div class="text-lg font-bold text-amber-400">$${(roi.idle_waste_monthly||0).toLocaleString()}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Effective Utilization</div><div class="text-lg font-bold ${(roi.effective_util_pct||0) > 50 ? 'text-emerald-400' : 'text-amber-400'}">${roi.effective_util_pct||0}%</div></div>`;
+  roiHTML += '</div>';
+  // Break-even table
+  roiHTML += '<div class="text-xs text-gray-400 mb-2 font-medium">Break-Even Analysis</div>';
+  roiHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  roiHTML += '<thead><tr class="text-gray-500 border-b border-gray-800"><th class="text-left py-2 px-2">Target $/call-min</th><th class="text-right py-2 px-2">Min Concurrent Calls Needed</th></tr></thead><tbody>';
+  for (const b of (roi.breakeven || [])) {
+    const met = (roi.current_avg_calls || 0) >= b.min_concurrent_calls;
+    roiHTML += `<tr class="border-b border-gray-800/50"><td class="py-1 px-2 text-white">$${b.target_cost_per_min}</td><td class="py-1 px-2 text-right ${met ? 'text-emerald-400' : 'text-gray-400'}">${b.min_concurrent_calls} ${met ? '&#10003;' : ''}</td></tr>`;
+  }
+  roiHTML += '</tbody></table></div></div>';
+
+  // ── 3. Scale Recommendation ──
+  const sr = d.scale_recommendation || {};
+  const actionColor = sr.action === 'scale_up' ? 'text-red-400' : sr.action === 'scale_down' ? 'text-amber-400' : 'text-emerald-400';
+  const actionBg = sr.action === 'scale_up' ? 'bg-red-500/10 border-red-500/30' : sr.action === 'scale_down' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-emerald-500/10 border-emerald-500/30';
+  let srHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Scale Recommendation</h3>';
+  srHTML += '<p class="text-xs text-gray-500 mb-4">Based on P95/P99 utilization patterns</p>';
+  srHTML += `<div class="rounded-lg border p-4 mb-4 ${actionBg}">`;
+  srHTML += `<div class="text-sm font-semibold ${actionColor} mb-1">${sr.action === 'scale_up' ? 'SCALE UP' : sr.action === 'scale_down' ? 'SCALE DOWN' : 'OPTIMAL'}</div>`;
+  srHTML += `<div class="text-xs text-gray-300">${sr.detail || ''}</div>`;
+  srHTML += '</div>';
+  srHTML += '<div class="grid grid-cols-2 md:grid-cols-5 gap-3">';
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Current GPUs</div><div class="text-white font-bold">${sr.current_gpus||0}</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">P95 Util</div><div class="text-white font-bold">${sr.p95_util||0}%</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">P99 Util</div><div class="text-white font-bold">${sr.p99_util||0}%</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Min GPUs (P95)</div><div class="text-white font-bold">${sr.min_gpus_for_p95||0}</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Savings if Downscale</div><div class="text-emerald-400 font-bold">$${(sr.monthly_savings_if_downscale||0).toLocaleString()}/mo</div></div>`;
+  srHTML += '</div></div>';
+
+  // ── 4. Cloud Cost Comparison ──
+  let ccHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Cloud Cost Comparison</h3>';
+  ccHTML += `<p class="text-xs text-gray-500 mb-4">Your ${SERVERS.reduce((a,s)=>a,0) || 16} GPUs at $${(roi.monthly_cost||25000).toLocaleString()}/mo vs cloud providers (scaled to ${sr.current_gpus||16} GPUs)</p>`;
+  ccHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  ccHTML += '<thead><tr class="text-gray-500 border-b border-gray-800">';
+  ccHTML += '<th class="text-left py-2 px-2">Provider</th><th class="text-left py-2 px-2">GPU Config</th><th class="text-right py-2 px-2">$/hr (base)</th><th class="text-right py-2 px-2">$/mo (scaled)</th><th class="text-right py-2 px-2">You Save</th><th class="text-left py-2 px-2">Note</th>';
+  ccHTML += '</tr></thead><tbody>';
+  // Your row first
+  ccHTML += `<tr class="border-b border-gray-800/50 bg-emerald-500/10"><td class="py-2 px-2 text-emerald-400 font-semibold">Your Cluster</td><td class="py-2 px-2 text-gray-300">8x H200 + 8x RTX 5090</td><td class="py-2 px-2 text-right text-white">$${(roi.hourly_cost||0).toFixed(2)}</td><td class="py-2 px-2 text-right text-white font-bold">$${(roi.monthly_cost||0).toLocaleString()}</td><td class="py-2 px-2 text-right text-emerald-400">-</td><td class="py-2 px-2 text-gray-500">Dedicated</td></tr>`;
+  for (const cp of (d.cloud_comparison || [])) {
+    const saveC = cp.savings_vs_you > 0 ? 'text-emerald-400' : 'text-red-400';
+    const saveTxt = cp.savings_vs_you > 0 ? `+$${cp.savings_vs_you.toLocaleString()}` : `-$${Math.abs(cp.savings_vs_you).toLocaleString()}`;
+    ccHTML += `<tr class="border-b border-gray-800/50">`;
+    ccHTML += `<td class="py-2 px-2 text-white">${cp.provider}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-gray-400">${cp.gpu}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right text-gray-300">$${cp.hourly.toFixed(2)}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right text-gray-300">$${cp.scaled_monthly.toLocaleString()}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right ${saveC}">${saveTxt}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-gray-500">${cp.note}</td>`;
+    ccHTML += '</tr>';
+  }
+  ccHTML += '</tbody></table></div></div>';
+
+  el.innerHTML = wiHTML + roiHTML + srHTML + ccHTML;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -3361,6 +3646,7 @@ function renderAll() {
   else if (activeTab === 'agent') renderAgent();
   else if (activeTab === 'analytics') renderAnalytics();
   else if (activeTab === 'proactive') renderProactive();
+  else if (activeTab === 'capacity') renderCapacity();
 }
 
 // ── Data Fetching ──

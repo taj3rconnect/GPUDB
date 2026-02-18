@@ -72,6 +72,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('agent')" id="tab-agent">Agent</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('analytics')" id="tab-analytics">Analytics & Cost</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
 </div>
 
 <!-- Content -->
@@ -84,6 +85,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-agent" class="hidden"></div>
   <div id="page-analytics" class="hidden"></div>
   <div id="page-proactive" class="hidden"></div>
+  <div id="page-capacity" class="hidden"></div>
 </div>
 
 <script>
@@ -103,6 +105,7 @@ let agentData = null;
 let analyticsData = null;
 let analyticsLoaded = false;
 let proactiveData = null;
+let capacityData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -139,7 +142,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -149,6 +152,7 @@ function switchTab(tab) {
   if (tab === 'agent') loadAgent();
   if (tab === 'analytics') loadAnalytics();
   if (tab === 'proactive') loadProactive();
+  if (tab === 'capacity') loadCapacity();
 }
 
 // ── Overview Tab ──
@@ -1453,6 +1457,108 @@ function renderProactive() {
   el.innerHTML = paHTML + erHTML + phHTML + suHTML + clHTML + ttHTML + cfHTML + dtHTML;
 }
 
+// ── Capacity Planner Tab ──
+async function loadCapacity() {
+  try {
+    const r = await fetch('/api/gpu?endpoint=capacity');
+    capacityData = await r.json();
+    renderCapacity();
+  } catch(e) { console.error('Capacity load error:', e); }
+}
+
+function renderCapacity() {
+  const el = document.getElementById('page-capacity');
+  if (!capacityData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading capacity data...</div>'; return; }
+  const d = capacityData;
+
+  // ── 1. What-If Simulator ──
+  let wiHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">What-If Simulator</h3>';
+  wiHTML += '<p class="text-xs text-gray-500 mb-4">Projected metrics at different concurrent call levels</p>';
+  wiHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  wiHTML += '<thead><tr class="text-gray-500 border-b border-gray-800">';
+  wiHTML += '<th class="text-left py-2 px-2">Calls</th><th class="text-right py-2 px-2">GPU Util</th><th class="text-right py-2 px-2">TTFT (ms)</th><th class="text-right py-2 px-2">E2E (s)</th><th class="text-right py-2 px-2">KV Cache</th><th class="text-right py-2 px-2">GPUs Needed</th><th class="text-center py-2 px-2">Quality</th><th class="text-center py-2 px-2">Feasible</th>';
+  wiHTML += '</tr></thead><tbody>';
+  for (const w of (d.what_if || [])) {
+    const utilC = w.projected_gpu_util > 85 ? 'text-red-400' : w.projected_gpu_util > 60 ? 'text-amber-400' : 'text-emerald-400';
+    const qC = w.quality === 'good' ? 'text-emerald-400' : w.quality === 'degraded' ? 'text-amber-400' : 'text-red-400';
+    const fC = w.feasible ? 'text-emerald-400' : 'text-red-400';
+    const ttftC = w.projected_ttft_ms > 600 ? 'text-red-400' : w.projected_ttft_ms > 300 ? 'text-amber-400' : 'text-emerald-400';
+    const highlight = w.target_calls === Math.round(d.roi?.current_avg_calls || 0) ? 'bg-emerald-500/10' : '';
+    wiHTML += `<tr class="border-b border-gray-800/50 ${highlight}">`;
+    wiHTML += `<td class="py-2 px-2 text-white font-medium">${w.target_calls}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right ${utilC}">${w.projected_gpu_util}%</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right ${ttftC}">${w.projected_ttft_ms.toFixed(0)}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.projected_e2e_s.toFixed(2)}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.projected_kv_cache}%</td>`;
+    wiHTML += `<td class="py-2 px-2 text-right text-gray-300">${w.gpus_needed_for_80pct}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-center ${qC}">${w.quality}</td>`;
+    wiHTML += `<td class="py-2 px-2 text-center ${fC}">${w.feasible ? 'Yes' : 'No'}</td>`;
+    wiHTML += '</tr>';
+  }
+  wiHTML += '</tbody></table></div></div>';
+
+  // ── 2. GPU ROI Calculator ──
+  const roi = d.roi || {};
+  let roiHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">GPU ROI Calculator</h3>';
+  roiHTML += '<p class="text-xs text-gray-500 mb-4">Cost efficiency and break-even analysis</p>';
+  roiHTML += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">';
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Monthly Cost</div><div class="text-lg font-bold text-white">$${(roi.monthly_cost||0).toLocaleString()}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Cost / Call-Min</div><div class="text-lg font-bold ${(roi.current_cost_per_call_min||0) > 0.10 ? 'text-red-400' : 'text-emerald-400'}">$${(roi.current_cost_per_call_min||0).toFixed(4)}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Idle Waste / Month</div><div class="text-lg font-bold text-amber-400">$${(roi.idle_waste_monthly||0).toLocaleString()}</div></div>`;
+  roiHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500 mb-1">Effective Utilization</div><div class="text-lg font-bold ${(roi.effective_util_pct||0) > 50 ? 'text-emerald-400' : 'text-amber-400'}">${roi.effective_util_pct||0}%</div></div>`;
+  roiHTML += '</div>';
+  roiHTML += '<div class="text-xs text-gray-400 mb-2 font-medium">Break-Even Analysis</div>';
+  roiHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  roiHTML += '<thead><tr class="text-gray-500 border-b border-gray-800"><th class="text-left py-2 px-2">Target $/call-min</th><th class="text-right py-2 px-2">Min Concurrent Calls Needed</th></tr></thead><tbody>';
+  for (const b of (roi.breakeven || [])) {
+    const met = (roi.current_avg_calls || 0) >= b.min_concurrent_calls;
+    roiHTML += `<tr class="border-b border-gray-800/50"><td class="py-1 px-2 text-white">$${b.target_cost_per_min}</td><td class="py-1 px-2 text-right ${met ? 'text-emerald-400' : 'text-gray-400'}">${b.min_concurrent_calls} ${met ? '&#10003;' : ''}</td></tr>`;
+  }
+  roiHTML += '</tbody></table></div></div>';
+
+  // ── 3. Scale Recommendation ──
+  const sr = d.scale_recommendation || {};
+  const actionColor = sr.action === 'scale_up' ? 'text-red-400' : sr.action === 'scale_down' ? 'text-amber-400' : 'text-emerald-400';
+  const actionBg = sr.action === 'scale_up' ? 'bg-red-500/10 border-red-500/30' : sr.action === 'scale_down' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-emerald-500/10 border-emerald-500/30';
+  let srHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Scale Recommendation</h3>';
+  srHTML += '<p class="text-xs text-gray-500 mb-4">Based on P95/P99 utilization patterns</p>';
+  srHTML += `<div class="rounded-lg border p-4 mb-4 ${actionBg}">`;
+  srHTML += `<div class="text-sm font-semibold ${actionColor} mb-1">${sr.action === 'scale_up' ? 'SCALE UP' : sr.action === 'scale_down' ? 'SCALE DOWN' : 'OPTIMAL'}</div>`;
+  srHTML += `<div class="text-xs text-gray-300">${sr.detail || ''}</div>`;
+  srHTML += '</div>';
+  srHTML += '<div class="grid grid-cols-2 md:grid-cols-5 gap-3">';
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Current GPUs</div><div class="text-white font-bold">${sr.current_gpus||0}</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">P95 Util</div><div class="text-white font-bold">${sr.p95_util||0}%</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">P99 Util</div><div class="text-white font-bold">${sr.p99_util||0}%</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Min GPUs (P95)</div><div class="text-white font-bold">${sr.min_gpus_for_p95||0}</div></div>`;
+  srHTML += `<div class="glass-bright rounded-lg p-3"><div class="text-[10px] text-gray-500">Savings if Downscale</div><div class="text-emerald-400 font-bold">$${(sr.monthly_savings_if_downscale||0).toLocaleString()}/mo</div></div>`;
+  srHTML += '</div></div>';
+
+  // ── 4. Cloud Cost Comparison ──
+  let ccHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Cloud Cost Comparison</h3>';
+  ccHTML += `<p class="text-xs text-gray-500 mb-4">Your ${sr.current_gpus||16} GPUs at $${(roi.monthly_cost||25000).toLocaleString()}/mo vs cloud providers</p>`;
+  ccHTML += '<div class="overflow-x-auto"><table class="w-full text-xs">';
+  ccHTML += '<thead><tr class="text-gray-500 border-b border-gray-800">';
+  ccHTML += '<th class="text-left py-2 px-2">Provider</th><th class="text-left py-2 px-2">GPU Config</th><th class="text-right py-2 px-2">$/hr (base)</th><th class="text-right py-2 px-2">$/mo (scaled)</th><th class="text-right py-2 px-2">You Save</th><th class="text-left py-2 px-2">Note</th>';
+  ccHTML += '</tr></thead><tbody>';
+  ccHTML += `<tr class="border-b border-gray-800/50 bg-emerald-500/10"><td class="py-2 px-2 text-emerald-400 font-semibold">Your Cluster</td><td class="py-2 px-2 text-gray-300">8x H200 + 8x RTX 5090</td><td class="py-2 px-2 text-right text-white">$${(roi.hourly_cost||0).toFixed(2)}</td><td class="py-2 px-2 text-right text-white font-bold">$${(roi.monthly_cost||0).toLocaleString()}</td><td class="py-2 px-2 text-right text-emerald-400">-</td><td class="py-2 px-2 text-gray-500">Dedicated</td></tr>`;
+  for (const cp of (d.cloud_comparison || [])) {
+    const saveC = cp.savings_vs_you > 0 ? 'text-emerald-400' : 'text-red-400';
+    const saveTxt = cp.savings_vs_you > 0 ? `+$${cp.savings_vs_you.toLocaleString()}` : `-$${Math.abs(cp.savings_vs_you).toLocaleString()}`;
+    ccHTML += `<tr class="border-b border-gray-800/50">`;
+    ccHTML += `<td class="py-2 px-2 text-white">${cp.provider}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-gray-400">${cp.gpu}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right text-gray-300">$${cp.hourly.toFixed(2)}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right text-gray-300">$${cp.scaled_monthly.toLocaleString()}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-right ${saveC}">${saveTxt}</td>`;
+    ccHTML += `<td class="py-2 px-2 text-gray-500">${cp.note}</td>`;
+    ccHTML += '</tr>';
+  }
+  ccHTML += '</tbody></table></div></div>';
+
+  el.innerHTML = wiHTML + roiHTML + srHTML + ccHTML;
+}
+
 // ── Render All ──
 function renderAll() {
   if (activeTab === 'overview') renderOverview();
@@ -1463,6 +1569,7 @@ function renderAll() {
   else if (activeTab === 'agent') renderAgent();
   else if (activeTab === 'analytics') renderAnalytics();
   else if (activeTab === 'proactive') renderProactive();
+  else if (activeTab === 'capacity') renderCapacity();
 }
 
 // ── Data Fetching ──

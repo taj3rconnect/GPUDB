@@ -21,6 +21,8 @@ class handler(BaseHTTPRequestHandler):
             upstream = f"{H200_API}/api/analytics"
         elif endpoint == "proactive":
             upstream = f"{H200_API}/api/proactive"
+        elif endpoint == "capacity":
+            upstream = f"{H200_API}/api/capacity"
         elif server_key not in ("h200", "rtx5090"):
             self.send_response(400)
             self.send_header("Content-Type", "application/json")

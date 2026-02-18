@@ -641,6 +641,205 @@ async def get_agent_status():
         return {"error": str(e), "status": "offline"}
 
 
+@app.get("/api/network")
+async def get_network():
+    """Network & I/O — GPU topology, network throughput, model loading, storage I/O."""
+    result = {
+        "gpu_topology": {},
+        "network_throughput": {},
+        "storage_io": {},
+        "model_loading": {},
+    }
+
+    # ── 1. GPU-to-GPU Topology & Communication ──
+    for sk, server in SERVERS.items():
+        try:
+            topo_out = await asyncio.wait_for(
+                run_command(server, "nvidia-smi topo -m 2>/dev/null"),
+                timeout=10
+            )
+            # Parse topology matrix
+            lines = [l for l in topo_out.strip().split("\n") if l.strip()]
+            topo_matrix = []
+            headers = []
+            for i, line in enumerate(lines):
+                parts = [p.strip() for p in line.split("\t") if p.strip()]
+                if i == 0:
+                    headers = parts
+                elif parts:
+                    row_label = parts[0] if parts else ""
+                    row_data = parts[1:] if len(parts) > 1 else []
+                    topo_matrix.append({"label": row_label, "connections": row_data})
+
+            # Get NVLink status
+            nvlink_out = await asyncio.wait_for(
+                run_command(server, "nvidia-smi nvlink -s 2>/dev/null"),
+                timeout=10
+            )
+
+            result["gpu_topology"][sk] = {
+                "server_name": server["name"],
+                "headers": headers,
+                "matrix": topo_matrix,
+                "nvlink_raw": nvlink_out[:2000] if nvlink_out else "Not available",
+            }
+        except Exception as e:
+            result["gpu_topology"][sk] = {"server_name": server["name"], "error": str(e)}
+
+    # ── 2. Network Throughput Timeline ──
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if len(sk_hist) < 2:
+            result["network_throughput"][sk] = {"server_name": SERVERS[sk]["name"], "timeline": []}
+            continue
+
+        timeline = []
+        prev = None
+        for p in sk_hist[-120:]:
+            if prev and p.get("net_rx", 0) > 0:
+                dt = max(p["t"] - prev["t"], 0.1)
+                rx_bps = (p["net_rx"] - prev["net_rx"]) * 8 / dt if p["net_rx"] >= prev["net_rx"] else 0
+                tx_bps = (p["net_tx"] - prev["net_tx"]) * 8 / dt if p["net_tx"] >= prev["net_tx"] else 0
+                timeline.append({
+                    "t": p["t"],
+                    "rx_bps": round(rx_bps),
+                    "tx_bps": round(tx_bps),
+                    "rx_mbps": round(rx_bps / 1e6, 2),
+                    "tx_mbps": round(tx_bps / 1e6, 2),
+                })
+            prev = p
+
+        # Anomaly detection: flag points > 2x average
+        if timeline:
+            avg_rx = sum(t["rx_bps"] for t in timeline) / len(timeline)
+            avg_tx = sum(t["tx_bps"] for t in timeline) / len(timeline)
+            peak_rx = max(t["rx_bps"] for t in timeline)
+            peak_tx = max(t["tx_bps"] for t in timeline)
+            for t in timeline:
+                t["rx_anomaly"] = t["rx_bps"] > avg_rx * 3 if avg_rx > 0 else False
+                t["tx_anomaly"] = t["tx_bps"] > avg_tx * 3 if avg_tx > 0 else False
+        else:
+            avg_rx = avg_tx = peak_rx = peak_tx = 0
+
+        result["network_throughput"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "timeline": timeline[-60:],
+            "avg_rx_mbps": round(avg_rx / 1e6, 2),
+            "avg_tx_mbps": round(avg_tx / 1e6, 2),
+            "peak_rx_mbps": round(peak_rx / 1e6, 2),
+            "peak_tx_mbps": round(peak_tx / 1e6, 2),
+            "anomalies": sum(1 for t in timeline if t.get("rx_anomaly") or t.get("tx_anomaly")),
+        }
+
+    # ── 3. Storage I/O ──
+    for sk, server in SERVERS.items():
+        try:
+            # Get disk I/O stats from /proc/diskstats + current throughput via iostat-like parsing
+            io_out = await asyncio.wait_for(
+                run_command(server, "cat /proc/diskstats 2>/dev/null | head -20"),
+                timeout=10
+            )
+            # Get disk usage
+            disk_hist = list(disk_history.get(sk, []))
+            disk_info = {}
+            if disk_hist:
+                latest = disk_hist[-1]
+                disk_info = {
+                    "used_pct": latest.get("pct", 0),
+                    "used_bytes": latest.get("used_bytes", 0),
+                    "total_bytes": latest.get("total_bytes", 0),
+                }
+                # Trend
+                if len(disk_hist) >= 2:
+                    first = disk_hist[0]
+                    last = disk_hist[-1]
+                    dt_hours = max((last["t"] - first["t"]) / 3600, 0.01)
+                    growth_pct_hour = (last["pct"] - first["pct"]) / dt_hours
+                    remaining = 100 - last["pct"]
+                    days_until_full = remaining / max(growth_pct_hour * 24, 0.0001) if growth_pct_hour > 0 else 9999
+                    disk_info["growth_pct_hour"] = round(growth_pct_hour, 4)
+                    disk_info["days_until_full"] = round(min(days_until_full, 9999), 1)
+
+            # Parse diskstats for I/O activity
+            io_stats = []
+            for line in io_out.strip().split("\n"):
+                parts = line.split()
+                if len(parts) >= 14:
+                    dev = parts[2]
+                    if dev.startswith("loop") or dev.startswith("ram"):
+                        continue
+                    reads = int(parts[3])
+                    read_sectors = int(parts[5])
+                    writes = int(parts[7])
+                    write_sectors = int(parts[9])
+                    io_stats.append({
+                        "device": dev,
+                        "reads": reads,
+                        "read_mb": round(read_sectors * 512 / 1e6, 1),
+                        "writes": writes,
+                        "write_mb": round(write_sectors * 512 / 1e6, 1),
+                    })
+
+            result["storage_io"][sk] = {
+                "server_name": SERVERS[sk]["name"],
+                "disk": disk_info,
+                "devices": io_stats[:10],  # top 10 devices
+            }
+        except Exception as e:
+            result["storage_io"][sk] = {"server_name": SERVERS[sk]["name"], "error": str(e)}
+
+    # ── 4. Model Loading & Warmup ──
+    # Track vLLM model info and KV cache warmup from history
+    for sk in SERVERS:
+        sk_hist = list(history[sk])
+        if not sk_hist:
+            continue
+        # KV cache warmup: how quickly does KV cache fill from 0 after restart
+        kv_values = [p.get("kv_cache", 0) for p in sk_hist]
+        first_nonzero = next((i for i, v in enumerate(kv_values) if v > 0), -1)
+        warmup_samples = 0
+        if first_nonzero >= 0 and len(kv_values) > first_nonzero + 1:
+            # Count how many samples until KV cache stabilizes (change < 0.1 for 10 consecutive)
+            stable_count = 0
+            for i in range(first_nonzero + 1, len(kv_values)):
+                if abs(kv_values[i] - kv_values[i-1]) < 0.1:
+                    stable_count += 1
+                    if stable_count >= 10:
+                        warmup_samples = i - first_nonzero
+                        break
+                else:
+                    stable_count = 0
+
+        # Current model info from vLLM
+        latest_data = None
+        try:
+            latest_data = await asyncio.wait_for(fetch_gpu_data(sk), timeout=10)
+        except Exception:
+            pass
+
+        models = []
+        if latest_data and latest_data.get("vllm"):
+            for v in latest_data["vllm"]:
+                models.append({
+                    "port": v.get("port"),
+                    "model_name": v.get("model_name", "unknown"),
+                    "kv_cache_usage": v.get("kv_cache_usage", 0),
+                    "requests_running": v.get("requests_running", 0),
+                    "total_requests": v.get("total_requests", 0),
+                })
+
+        result["model_loading"][sk] = {
+            "server_name": SERVERS[sk]["name"],
+            "models": models,
+            "kv_warmup_samples": warmup_samples,
+            "kv_warmup_seconds": warmup_samples * 3,  # ~3s per sample
+            "current_kv": kv_values[-1] if kv_values else 0,
+            "kv_history": kv_values[-60:],
+        }
+
+    return result
+
+
 @app.get("/api/quality")
 async def get_quality():
     """Call Quality Deep Dive — waterfall, degradation heatmap, latency curve, SLA compliance."""
@@ -2046,6 +2245,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('proactive')" id="tab-proactive">Alerts & Ops</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('capacity')" id="tab-capacity">Capacity Planner</button>
   <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('quality')" id="tab-quality">Call Quality</button>
+  <button class="tab-inactive pb-2 text-sm font-medium px-1" onclick="switchTab('network')" id="tab-network">Network & I/O</button>
 </div>
 
 <!-- Content -->
@@ -2060,6 +2260,7 @@ tailwind.config = { theme: { extend: { colors: { surface: { 50:'#0a0a0f', 100:'#
   <div id="page-proactive" class="hidden"></div>
   <div id="page-capacity" class="hidden"></div>
   <div id="page-quality" class="hidden"></div>
+  <div id="page-network" class="hidden"></div>
 </div>
 
 <script>
@@ -2081,6 +2282,7 @@ let analyticsLoaded = false;
 let proactiveData = null;
 let capacityData = null;
 let qualityData = null;
+let networkData = null;
 
 // ── Utilities ──
 function fmt(n) { return n.toLocaleString(); }
@@ -2117,7 +2319,7 @@ function sparklineSVG(data, width, height, color) {
 // ── Tab Switching ──
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality'].forEach(t => {
+  ['overview','traffic','history','software','daily','agent','analytics','proactive','capacity','quality','network'].forEach(t => {
     document.getElementById('page-'+t).classList.toggle('hidden', t !== tab);
     document.getElementById('tab-'+t).className = t === tab ? 'tab-active pb-2 text-sm font-medium px-1' : 'tab-inactive pb-2 text-sm font-medium px-1';
   });
@@ -2129,6 +2331,7 @@ function switchTab(tab) {
   if (tab === 'proactive') loadProactive();
   if (tab === 'capacity') loadCapacity();
   if (tab === 'quality') loadQuality();
+  if (tab === 'network') loadNetwork();
 }
 
 // ── Overview Tab ──
@@ -3799,6 +4002,163 @@ function renderAll() {
   else if (activeTab === 'proactive') renderProactive();
   else if (activeTab === 'capacity') renderCapacity();
   else if (activeTab === 'quality') renderQuality();
+  else if (activeTab === 'network') renderNetwork();
+}
+
+// ── Network & I/O Tab ──
+async function loadNetwork() {
+  try {
+    const r = await fetch('/api/network');
+    networkData = await r.json();
+    renderNetwork();
+  } catch(e) { console.error('Network load error:', e); }
+}
+
+function renderNetwork() {
+  const el = document.getElementById('page-network');
+  if (!networkData) { el.innerHTML = '<div class="text-gray-500 text-center py-12">Loading network data...</div>'; return; }
+  const d = networkData;
+
+  // ── 1. GPU Topology ──
+  let topoHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">GPU-to-GPU Topology</h3>';
+  topoHTML += '<p class="text-xs text-gray-500 mb-4">NVLink/PCIe interconnect matrix between GPUs</p>';
+  topoHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">';
+  for (const [sk, topo] of Object.entries(d.gpu_topology || {})) {
+    topoHTML += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-2">${topo.server_name || sk}</div>`;
+    if (topo.error) {
+      topoHTML += `<div class="text-xs text-red-400">${topo.error}</div>`;
+    } else if ((topo.matrix||[]).length > 0) {
+      topoHTML += '<div class="overflow-x-auto"><table class="text-[9px]">';
+      if ((topo.headers||[]).length > 0) {
+        topoHTML += '<thead><tr>';
+        for (const h of topo.headers) topoHTML += `<th class="px-1 py-0.5 text-gray-500">${h}</th>`;
+        topoHTML += '</tr></thead>';
+      }
+      topoHTML += '<tbody>';
+      for (const row of topo.matrix) {
+        topoHTML += '<tr>';
+        topoHTML += `<td class="px-1 py-0.5 text-gray-400 font-medium">${row.label}</td>`;
+        for (const conn of row.connections) {
+          const color = conn === 'NV18' || conn.startsWith('NV') ? 'text-emerald-400' : conn === 'SYS' ? 'text-gray-500' : conn === 'X' ? 'text-white' : conn === 'PHB' ? 'text-cyan-400' : 'text-gray-400';
+          topoHTML += `<td class="px-1 py-0.5 text-center ${color}">${conn}</td>`;
+        }
+        topoHTML += '</tr>';
+      }
+      topoHTML += '</tbody></table></div>';
+    } else {
+      topoHTML += '<div class="text-xs text-gray-500">No topology data available</div>';
+    }
+    topoHTML += '</div>';
+  }
+  topoHTML += '</div></div>';
+
+  // ── 2. Network Throughput ──
+  let netHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Network Throughput Timeline</h3>';
+  netHTML += '<p class="text-xs text-gray-500 mb-4">RX/TX bandwidth with anomaly detection</p>';
+  netHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">';
+  for (const [sk, net] of Object.entries(d.network_throughput || {})) {
+    netHTML += `<div class="glass-bright rounded-lg p-4"><div class="flex justify-between items-center mb-2">`;
+    netHTML += `<span class="text-xs text-white font-medium">${net.server_name || sk}</span>`;
+    netHTML += `<span class="text-[10px] ${(net.anomalies||0) > 0 ? 'text-red-400' : 'text-gray-500'}">${net.anomalies||0} anomalies</span>`;
+    netHTML += '</div>';
+    netHTML += '<div class="grid grid-cols-4 gap-2 mb-3 text-[10px]">';
+    netHTML += `<div><span class="text-gray-500">Avg RX</span><div class="text-cyan-400 font-medium">${net.avg_rx_mbps||0} Mbps</div></div>`;
+    netHTML += `<div><span class="text-gray-500">Peak RX</span><div class="text-cyan-400 font-medium">${net.peak_rx_mbps||0} Mbps</div></div>`;
+    netHTML += `<div><span class="text-gray-500">Avg TX</span><div class="text-emerald-400 font-medium">${net.avg_tx_mbps||0} Mbps</div></div>`;
+    netHTML += `<div><span class="text-gray-500">Peak TX</span><div class="text-emerald-400 font-medium">${net.peak_tx_mbps||0} Mbps</div></div>`;
+    netHTML += '</div>';
+    // Mini timeline bars
+    const tl = net.timeline || [];
+    if (tl.length > 0) {
+      const maxBps = Math.max(...tl.map(t => Math.max(t.rx_bps, t.tx_bps)), 1);
+      netHTML += '<div class="space-y-0.5">';
+      for (const t of tl.slice(-30)) {
+        const time = new Date(t.t * 1000).toLocaleTimeString();
+        const rxW = t.rx_bps / maxBps * 100;
+        const txW = t.tx_bps / maxBps * 100;
+        const anomClass = (t.rx_anomaly || t.tx_anomaly) ? 'border-l-2 border-red-400 pl-1' : '';
+        netHTML += `<div class="flex items-center gap-1 text-[9px] ${anomClass}">`;
+        netHTML += `<span class="text-gray-600 w-12">${time}</span>`;
+        netHTML += `<div class="flex-1 flex gap-0.5">`;
+        netHTML += `<div class="h-2 rounded bg-cyan-500/40" style="width:${rxW}%" title="RX: ${t.rx_mbps} Mbps"></div>`;
+        netHTML += `<div class="h-2 rounded bg-emerald-500/40" style="width:${txW}%" title="TX: ${t.tx_mbps} Mbps"></div>`;
+        netHTML += '</div>';
+        netHTML += `<span class="text-gray-500 w-20 text-right">${t.rx_mbps}/${t.tx_mbps}</span>`;
+        netHTML += '</div>';
+      }
+      netHTML += '</div>';
+    } else {
+      netHTML += '<div class="text-xs text-gray-500">No throughput data yet.</div>';
+    }
+    netHTML += '</div>';
+  }
+  netHTML += '</div></div>';
+
+  // ── 3. Storage I/O ──
+  let sioHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Storage I/O</h3>';
+  sioHTML += '<p class="text-xs text-gray-500 mb-4">Disk usage trends and I/O activity per server</p>';
+  sioHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">';
+  for (const [sk, sio] of Object.entries(d.storage_io || {})) {
+    sioHTML += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-2">${sio.server_name || sk}</div>`;
+    if (sio.error) {
+      sioHTML += `<div class="text-xs text-red-400">${sio.error}</div>`;
+    } else {
+      const disk = sio.disk || {};
+      if (disk.used_pct !== undefined) {
+        const diskC = disk.used_pct > 90 ? 'text-red-400' : disk.used_pct > 80 ? 'text-amber-400' : 'text-emerald-400';
+        sioHTML += `<div class="grid grid-cols-3 gap-2 mb-2 text-[10px]">`;
+        sioHTML += `<div><span class="text-gray-500">Used</span><div class="${diskC} font-medium">${disk.used_pct}%</div></div>`;
+        sioHTML += `<div><span class="text-gray-500">Growth/hr</span><div class="text-gray-300 font-medium">${(disk.growth_pct_hour||0).toFixed(3)}%</div></div>`;
+        sioHTML += `<div><span class="text-gray-500">Days til Full</span><div class="${(disk.days_until_full||9999) < 30 ? 'text-red-400' : 'text-gray-300'} font-medium">${(disk.days_until_full||9999) > 999 ? '999+' : (disk.days_until_full||0).toFixed(0)}</div></div>`;
+        sioHTML += '</div>';
+        sioHTML += `<div class="h-2 rounded-full bg-gray-800 mb-3"><div class="h-2 rounded-full" style="width:${disk.used_pct}%;background:${disk.used_pct > 90 ? '#ef4444' : disk.used_pct > 80 ? '#f59e0b' : '#22c55e'}"></div></div>`;
+      }
+      // Device table
+      const devs = sio.devices || [];
+      if (devs.length > 0) {
+        sioHTML += '<table class="w-full text-[10px]">';
+        sioHTML += '<thead><tr class="text-gray-500"><th class="text-left py-0.5">Device</th><th class="text-right py-0.5">Reads</th><th class="text-right py-0.5">Read MB</th><th class="text-right py-0.5">Writes</th><th class="text-right py-0.5">Write MB</th></tr></thead>';
+        sioHTML += '<tbody>';
+        for (const dev of devs) {
+          sioHTML += `<tr class="border-t border-gray-800/30"><td class="py-0.5 text-gray-300">${dev.device}</td><td class="py-0.5 text-right text-gray-400">${dev.reads.toLocaleString()}</td><td class="py-0.5 text-right text-cyan-400">${dev.read_mb.toLocaleString()}</td><td class="py-0.5 text-right text-gray-400">${dev.writes.toLocaleString()}</td><td class="py-0.5 text-right text-emerald-400">${dev.write_mb.toLocaleString()}</td></tr>`;
+        }
+        sioHTML += '</tbody></table>';
+      }
+    }
+    sioHTML += '</div>';
+  }
+  sioHTML += '</div></div>';
+
+  // ── 4. Model Loading & Warmup ──
+  let mlHTML = '<div class="glass rounded-xl p-6 mb-6"><h3 class="text-white font-semibold mb-1">Model Loading & KV Cache Warmup</h3>';
+  mlHTML += '<p class="text-xs text-gray-500 mb-4">Active models and KV cache warmup timeline</p>';
+  mlHTML += '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">';
+  for (const [sk, ml] of Object.entries(d.model_loading || {})) {
+    mlHTML += `<div class="glass-bright rounded-lg p-4"><div class="text-xs text-white font-medium mb-2">${ml.server_name || sk}</div>`;
+    // Models list
+    const models = ml.models || [];
+    if (models.length > 0) {
+      for (const m of models) {
+        mlHTML += `<div class="flex justify-between items-center text-[10px] mb-1">`;
+        mlHTML += `<span class="text-gray-300">:${m.port} <span class="text-gray-500">${m.model_name}</span></span>`;
+        mlHTML += `<span class="text-gray-400">KV: <span class="${m.kv_cache_usage > 80 ? 'text-red-400' : 'text-emerald-400'}">${m.kv_cache_usage}%</span> | ${m.requests_running} running | ${(m.total_requests||0).toLocaleString()} total</span>`;
+        mlHTML += '</div>';
+      }
+    } else {
+      mlHTML += '<div class="text-[10px] text-gray-500">No vLLM models on this server</div>';
+    }
+    // KV warmup
+    mlHTML += `<div class="mt-2 text-[10px] text-gray-500">KV warmup: ${ml.kv_warmup_seconds||0}s (${ml.kv_warmup_samples||0} samples) | Current: ${(ml.current_kv||0).toFixed(1)}%</div>`;
+    // Mini KV sparkline
+    const kvH = ml.kv_history || [];
+    if (kvH.length > 2) {
+      mlHTML += '<div class="mt-1">' + sparklineSVG(kvH, 200, 20, '#22c55e') + '</div>';
+    }
+    mlHTML += '</div>';
+  }
+  mlHTML += '</div></div>';
+
+  el.innerHTML = topoHTML + netHTML + sioHTML + mlHTML;
 }
 
 // ── Call Quality Deep Dive Tab ──
